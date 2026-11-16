@@ -5,7 +5,7 @@
   "scripts": {
     "build": "tsc",
     "prepare": "tsc",
-    "check": "tsc && tsc -p src/worker/tsconfig.json && node scripts/check-widget.mjs",
+    "check": "tsc && tsc -p src/worker/tsconfig.json && node scripts/check-widget.mjs && node scripts/test-history.mjs",
     "deploy": "npm run check && wrangler deploy",
     "start": "node dist/cli.js",
     "login": "node dist/cli.js login"

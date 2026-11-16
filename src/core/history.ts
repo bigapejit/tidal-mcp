@@ -47,6 +47,9 @@ const FOREVER = 10_000_000_000;
 /** Most rows one Last.fm page can write: a track and a play per scrobble, plus two state updates. */
 const PAGE_WRITES = 200 * 2 + 2;
 
+/** The UTC day D1's daily limits count against. */
+const utcDay = () => new Date().toISOString().slice(0, 10);
+
 const SCHEMA = [
   // id: a hash of the lowercased artist and title, so a play can point at its track without a lookup.
   // tidal: NULL until looked up, '' when TIDAL has no match, otherwise the matched Track as JSON.
@@ -434,9 +437,14 @@ export class History {
     }
 
     for (let left = pages.backfill; left > 0 && !s.back_done; left--) {
-      const reservation = await this.reserve();
+      let reservation = await this.reserve();
       if (reservation === false) break; // today's write budget is spent
       const page = await this.lastfm.recent({ to: s.back_cursor + 1 });
+      // Midnight UTC passed while fetching: the page must fit the new day's budget, or wait for it.
+      if (reservation && reservation.day !== utcDay()) {
+        reservation = await this.reserve();
+        if (reservation === false) break;
+      }
       s.back_total ??= page.total;
       s.back_fetched += page.scrobbles.length;
       if (page.totalPages <= 1) {
@@ -464,19 +472,21 @@ export class History {
    * Claims a page's worth of today's write budget before a backfill page is fetched. The check and
    * the claim are one conditional UPDATE, so concurrent syncs can't both spend the last of it.
    * Resolves to the claim (to settle when the page is saved), undefined without a budget, or false
-   * when the budget is spent. A claim that is never settled (a crash mid-page) only overcounts.
+   * when the budget is spent. The claim covers the page's most writes plus the claim's own row. A
+   * claim that is never settled (a crash mid-page) only overcounts.
    */
   private async reserve(): Promise<{ day: string; rows: number } | undefined | false> {
     if (this.dailyWrites === Infinity) return undefined;
-    const day = new Date().toISOString().slice(0, 10);
+    const day = utcDay();
+    const rows = PAGE_WRITES + 1;
     const today = "(CASE WHEN day = ? THEN day_writes ELSE 0 END)";
     const claimed = await this.sql.batch([
       {
         sql: `UPDATE lastfm_sync SET day_writes = ${today} + ?, day = ? WHERE id = 1 AND ${today} + ? <= ?`,
-        params: [day, PAGE_WRITES, day, day, PAGE_WRITES, this.dailyWrites],
+        params: [day, rows, day, day, rows, this.dailyWrites],
       },
     ]);
-    return claimed > 0 && { day, rows: PAGE_WRITES };
+    return claimed > 0 && { day, rows };
   }
 
   /**
@@ -496,8 +506,9 @@ export class History {
       if (!tracks.has(id)) tracks.set(id, { id, artist: s.artist, title: s.title, album: s.album ?? null });
       plays.push({ uts: s.uts, id });
     }
-    const day = new Date().toISOString().slice(0, 10);
-    // A claim from before midnight UTC belongs to yesterday's count, which this page doesn't touch.
+    const day = utcDay();
+    // The page's real count replaces its claim; the claim's own UPDATE row stays counted. A claim
+    // from before midnight UTC belongs to yesterday's count, which this page doesn't touch.
     const release = reservation?.day === day ? reservation.rows - 1 : 0;
     // json_each keeps a whole page to one statement each, well under D1's 100 bound parameters.
     await this.sql.batch([
@@ -613,13 +624,16 @@ export class History {
       Float64Array.from(all, (a) => a.plays).sort().reverse()[Math.min(end, all.length) - 1] ?? 0;
     let { all, plays, names } = await this.rankArtists(range, 3);
     let floor = floorOf(all);
-    if (names > 4000 && (all.length < end || floor < 3)) {
+    // Recount from every name when the page reaches the left-out tail, or when the list ends at the
+    // page (left-out names may follow).
+    if (names > 4000 && (all.length <= end || floor < 3)) {
       ({ all, plays, names } = await this.rankArtists(range, 1));
       floor = floorOf(all);
     }
     const artists = all
       .filter((a) => a.plays >= floor)
-      .sort((a, b) => b.plays - a.plays || b.lastPlayed - a.lastPlayed)
+      // Name breaks ties, so both passes order equal counts the same and pages never overlap.
+      .sort((a, b) => b.plays - a.plays || b.lastPlayed - a.lastPlayed || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
       .slice(offset, end);
     if (artists.length) {
       const cached = await this.sql.all<{ name: string; tidal: string }>(
