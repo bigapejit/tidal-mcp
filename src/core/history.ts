@@ -54,8 +54,10 @@ const SCHEMA = [
     uts INTEGER NOT NULL, track INTEGER NOT NULL, PRIMARY KEY (uts, track)) WITHOUT ROWID`,
   // name: lowercased Last.fm artist name. tidal: as for tracks, with an Artist.
   `CREATE TABLE IF NOT EXISTS lastfm_artists (name TEXT PRIMARY KEY, tidal TEXT NOT NULL) WITHOUT ROWID`,
+  // lastfm_user: whose scrobbles these tables hold. One database holds one user's history.
   `CREATE TABLE IF NOT EXISTS lastfm_sync (
     id INTEGER PRIMARY KEY CHECK (id = 1),
+    lastfm_user TEXT NOT NULL,
     head INTEGER NOT NULL,
     fwd_hi INTEGER,
     fwd_cursor INTEGER,
@@ -70,6 +72,7 @@ const SCHEMA = [
 
 /** Import progress, one row. Times are unix seconds except synced_at (epoch ms). */
 interface SyncRow {
+  lastfm_user: string;
   /** Everything from back_cursor up to head is imported. */
   head: number;
   /** An unfinished walk for new scrobbles, from fwd_cursor down to head minus the overlap. */
@@ -257,26 +260,6 @@ async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promis
   return out;
 }
 
-/**
- * Folds ranked tracks that matched the same TIDAL track into the first of them, summing plays: the
- * scrobbler sometimes names one song two ways ("Khruangbin" and "Khruangbin & Leon Bridges").
- */
-export function mergeMatches(tracks: HistoryTrack[]): HistoryTrack[] {
-  const first = new Map<string, HistoryTrack>();
-  const out: HistoryTrack[] = [];
-  for (const t of tracks) {
-    const kept = t.tidal ? first.get(t.tidal.id) : undefined;
-    if (kept) {
-      kept.plays = (kept.plays ?? 0) + (t.plays ?? 0);
-      kept.lastPlayed = Math.max(kept.lastPlayed ?? 0, t.lastPlayed ?? 0);
-      continue;
-    }
-    if (t.tidal) first.set(t.tidal.id, t);
-    out.push(t);
-  }
-  return out.sort((a, b) => (b.plays ?? 0) - (a.plays ?? 0));
-}
-
 const decode = <T>(json: string | null | undefined): T | null | undefined =>
   json === null || json === undefined ? undefined : json === "" ? null : (JSON.parse(json) as T);
 
@@ -400,16 +383,26 @@ export class History {
     return ready;
   }
 
+  /** The import state, after checking it is the configured Last.fm user's. */
   private async row(): Promise<SyncRow | undefined> {
     const [row] = await this.sql.all<SyncRow>("SELECT * FROM lastfm_sync WHERE id = 1");
+    if (row && row.lastfm_user.toLowerCase() !== this.lastfm.user.toLowerCase()) {
+      // Mixing two people's plays would corrupt every count, and the old user's finished backfill
+      // would hide that the new user's older history was never imported.
+      throw new Error(
+        `The stored listening history is Last.fm user "${row.lastfm_user}"'s, not "${this.lastfm.user}"'s. ` +
+          "Clear the history database (the HISTORY_DB tables, or ~/.tidal-mcp/history.sqlite) to import another user.",
+      );
+    }
     return row;
   }
 
   /**
-   * Imports new scrobbles, then older ones, fetching at most `pages` Last.fm pages. Every page is
-   * saved with the walk's new position, so stopping between pages loses nothing.
+   * Imports new scrobbles, then older ones, fetching at most `pages.forward` and `pages.backfill`
+   * Last.fm pages. The budgets are separate so a busy day's re-read can't starve the backfill.
+   * Every page is saved with the walk's new position, so stopping between pages loses nothing.
    */
-  async sync(pages: number): Promise<Coverage> {
+  async sync(pages: { forward: number; backfill: number }): Promise<Coverage> {
     await this.ready();
     const now = Math.floor(Date.now() / 1000);
     const today = new Date().toISOString().slice(0, 10);
@@ -417,28 +410,40 @@ export class History {
     if (!s) {
       // The backfill covers everything before this moment; syncs cover everything after.
       await this.sql.batch([
-        { sql: "INSERT OR IGNORE INTO lastfm_sync (id, head, back_cursor) VALUES (1, ?, ?)", params: [now, now] },
+        {
+          sql: "INSERT OR IGNORE INTO lastfm_sync (id, lastfm_user, head, back_cursor) VALUES (1, ?, ?, ?)",
+          params: [this.lastfm.user, now, now],
+        },
       ]);
       s = (await this.row())!;
     }
     let written = 0;
+    /** Saves a page, then counts its writes toward today's budget right away, so a later failure can't lose them. */
+    const commit = async (scrobbles: Scrobble[], position: SqlStatement) => {
+      const n = await this.save(scrobbles, position);
+      written += n;
+      await this.sql.batch([
+        {
+          sql: "UPDATE lastfm_sync SET day_writes = CASE WHEN day = ? THEN day_writes + ? ELSE ? END, day = ? WHERE id = 1",
+          params: [today, n, n, today],
+        },
+      ]);
+    };
 
     // New scrobbles first, so recent history stays current while the backfill runs.
     if (s.fwd_hi === null) [s.fwd_hi, s.fwd_cursor] = [now, now];
-    while (pages > 0 && s.fwd_hi !== null) {
-      pages--;
+    for (let left = pages.forward; left > 0 && s.fwd_hi !== null; left--) {
       const page = await this.lastfm.recent({ from: Math.max(0, s.head - OVERLAP_SECONDS), to: s.fwd_cursor! + 1 });
       if (page.totalPages <= 1) [s.head, s.fwd_hi, s.fwd_cursor] = [Math.max(s.head, s.fwd_hi), null, null];
       else s.fwd_cursor = nextCursor(page.scrobbles, s.fwd_cursor!);
-      written += await this.save(page.scrobbles, {
+      await commit(page.scrobbles, {
         sql: "UPDATE lastfm_sync SET head = MAX(head, ?), fwd_hi = ?, fwd_cursor = ?, synced_at = ? WHERE id = 1",
         params: [s.head, s.fwd_hi, s.fwd_cursor, Date.now()],
       });
     }
 
     const writesToday = () => (s.day === today ? s.day_writes : 0) + written;
-    while (pages > 0 && !s.back_done && writesToday() < this.dailyWrites) {
-      pages--;
+    for (let left = pages.backfill; left > 0 && !s.back_done && writesToday() < this.dailyWrites; left--) {
       const page = await this.lastfm.recent({ to: s.back_cursor + 1 });
       s.back_total ??= page.total;
       s.back_fetched += page.scrobbles.length;
@@ -448,21 +453,13 @@ export class History {
       } else {
         s.back_cursor = nextCursor(page.scrobbles, s.back_cursor);
       }
-      written += await this.save(page.scrobbles, {
+      await commit(page.scrobbles, {
         sql: `UPDATE lastfm_sync SET back_cursor = MIN(back_cursor, ?), back_done = MAX(back_done, ?), back_total = ?,
                 back_fetched = ?, synced_at = ? WHERE id = 1`,
         params: [s.back_cursor, s.back_done, s.back_total, s.back_fetched, Date.now()],
       });
     }
 
-    if (written) {
-      await this.sql.batch([
-        {
-          sql: "UPDATE lastfm_sync SET day_writes = CASE WHEN day = ? THEN day_writes + ? ELSE ? END, day = ? WHERE id = 1",
-          params: [today, written, written, today],
-        },
-      ]);
-    }
     s.synced_at = Date.now();
     return coverage(s);
   }
@@ -505,7 +502,7 @@ export class History {
     const s = await this.row();
     if (s?.synced_at && Date.now() - s.synced_at < STALE_MS) return coverage(s);
     try {
-      return await this.sync(2);
+      return await this.sync({ forward: 1, backfill: 1 });
     } catch (err) {
       const latest = await this.row();
       return { ...coverage(latest), error: err instanceof Error ? err.message : String(err) };
@@ -527,27 +524,28 @@ export class History {
     };
   }
 
-  /** Most-played tracks in the range, with totals for the whole range. */
+  /**
+   * Most-played tracks in the range, with totals for the whole range. Tracks that matched the same
+   * TIDAL track count as one, before ranking, since the scrobbler sometimes names a song two ways
+   * ("Khruangbin" and "Khruangbin & Leon Bridges"); the most-played name represents it.
+   */
   async topTracks(range: Range, limit: number, offset: number, artist?: string) {
-    const counts = `SELECT track, COUNT(*) AS plays, MAX(uts) AS last FROM lastfm_plays
-                    WHERE uts >= ? AND uts < ? GROUP BY track`;
-    const columns = "t.id, t.artist, t.title, t.album, t.tidal, c.plays, c.last";
+    const filter = artist ? `%${artist.replace(/[!%_]/g, "!$&")}%` : null;
     const rows = await this.sql.all<TrackRow & { plays: number; last: number; total: number; track_count: number }>(
-      artist
-        ? // Filtering by artist needs every counted track's name.
-          `SELECT ${columns}, SUM(c.plays) OVER () AS total, COUNT(*) OVER () AS track_count
-           FROM (${counts}) c JOIN lastfm_tracks t ON t.id = c.track
-           WHERE t.artist LIKE ? ESCAPE '!'
-           ORDER BY c.plays DESC, c.last DESC LIMIT ? OFFSET ?`
-        : // Otherwise only the page's tracks are looked up, which keeps D1 rows read down.
-          `SELECT ${columns}, c.total, c.track_count
-           FROM (SELECT *, SUM(plays) OVER () AS total, COUNT(*) OVER () AS track_count FROM (${counts})
-                 ORDER BY plays DESC, last DESC LIMIT ? OFFSET ?) c
-           JOIN lastfm_tracks t ON t.id = c.track
-           ORDER BY c.plays DESC, c.last DESC`,
-      artist
-        ? [range.from, range.to, `%${artist.replace(/[!%_]/g, "!$&")}%`, limit + 1, offset]
-        : [range.from, range.to, limit + 1, offset],
+      `WITH c AS (SELECT track, COUNT(*) AS plays, MAX(uts) AS last FROM lastfm_plays
+                  WHERE uts >= ? AND uts < ? GROUP BY track),
+       j AS (SELECT t.id, t.artist, t.title, t.album, t.tidal,
+                    SUM(c.plays) OVER song AS plays, MAX(c.last) OVER song AS last,
+                    ROW_NUMBER() OVER (song ORDER BY c.plays DESC, c.last DESC) AS pick
+             FROM c JOIN lastfm_tracks t ON t.id = c.track
+             WHERE ? IS NULL OR t.artist LIKE ? ESCAPE '!'
+             WINDOW song AS (PARTITION BY CASE WHEN t.tidal IS NULL OR t.tidal = '' THEN 'lastfm:' || t.id
+                                               ELSE json_extract(t.tidal, '$.id') END))
+       SELECT id, artist, title, album, tidal, plays, last,
+              SUM(plays) OVER () AS total, COUNT(*) OVER () AS track_count
+       FROM j WHERE pick = 1
+       ORDER BY plays DESC, last DESC LIMIT ? OFFSET ?`,
+      [range.from, range.to, filter, filter, limit + 1, offset],
     );
     return {
       tracks: rows
@@ -563,12 +561,45 @@ export class History {
    * Most-played artists in the range, with collaborations credited to each artist.
    *
    * All time is ~10k names, which costs more than the Worker's 10 ms of CPU to receive and credit
-   * in JS. So when a range has over 4,000 names, solo names with fewer than 3 plays are left out:
-   * they can't reach a top list on their own, and collaborations (always included) still credit
-   * them. The SQL also flags which names need splitting, so most rows skip the regex.
+   * in JS. So when a range has over 4,000 names, solo names with fewer than 3 plays are left out
+   * of the first pass: they can't reach the top on their own, and collaborations (always included)
+   * still credit them, minus those one or two solo plays. One approximation remains there: a
+   * collaboration of two such names stays one entry ("A & B") instead of crediting both. A page
+   * that reaches artists with fewer than 3 plays is computed again from every name.
    */
   async topArtists(range: Range, limit: number, offset: number) {
-    const rows = await this.sql.all<{ artist: string; plays: number; tracks: number; last: number; multi: number; total: number }>(
+    const end = offset + limit;
+    // The lowest play count on the page; only artists at or above it need sorting.
+    const floorOf = (all: HistoryArtist[]) =>
+      Float64Array.from(all, (a) => a.plays).sort().reverse()[Math.min(end, all.length) - 1] ?? 0;
+    let { all, plays, names } = await this.rankArtists(range, 3);
+    let floor = floorOf(all);
+    if (names > 4000 && (all.length < end || floor < 3)) {
+      ({ all, plays, names } = await this.rankArtists(range, 1));
+      floor = floorOf(all);
+    }
+    const artists = all
+      .filter((a) => a.plays >= floor)
+      .sort((a, b) => b.plays - a.plays || b.lastPlayed - a.lastPlayed)
+      .slice(offset, end);
+    if (artists.length) {
+      const cached = await this.sql.all<{ name: string; tidal: string }>(
+        "SELECT name, tidal FROM lastfm_artists WHERE name IN (SELECT value FROM json_each(?))",
+        [JSON.stringify(artists.map((a) => a.name.toLowerCase()))],
+      );
+      const matches = new Map(cached.map((c) => [c.name, c.tidal]));
+      for (const a of artists) a.tidal = decode<Artist>(matches.get(a.name.toLowerCase()));
+    }
+    return { artists, more: all.length > end, plays };
+  }
+
+  /**
+   * Every artist in the range ranked by credited plays, from names with at least `minPlays` solo
+   * plays (applied only past 4,000 names) plus all collaborations. `plays` and `names` always
+   * cover the whole range.
+   */
+  private async rankArtists(range: Range, minPlays: number) {
+    const rows = await this.sql.all<{ artist: string | null; plays: number; tracks: number; last: number; multi: number }>(
       `WITH a AS (
          SELECT t.artist, SUM(c.plays) AS plays, COUNT(*) AS tracks, MAX(c.last) AS last,
                 (t.artist LIKE '% & %' OR t.artist LIKE '%, %' OR t.artist LIKE '% feat%' OR t.artist LIKE '% ft%'
@@ -578,10 +609,20 @@ export class History {
                WHERE uts >= ? AND uts < ? GROUP BY track) c
          JOIN lastfm_tracks t ON t.id = c.track
          GROUP BY t.artist)
-       SELECT a.*, (SELECT SUM(plays) FROM a) AS total FROM a
-       WHERE multi OR plays >= CASE WHEN (SELECT COUNT(*) FROM a) > 4000 THEN 3 ELSE 1 END`,
-      [range.from, range.to],
+       -- The totals ride along as one row with no artist.
+       SELECT NULL AS artist, COALESCE(SUM(plays), 0) AS plays, COUNT(*) AS tracks, 0 AS last, 0 AS multi FROM a
+       UNION ALL
+       SELECT artist, plays, tracks, last, multi FROM a
+       WHERE multi OR plays >= CASE WHEN (SELECT COUNT(*) FROM a) > 4000 THEN ? ELSE 1 END`,
+      [range.from, range.to, minPlays],
     );
+    const totals = rows.find((r) => r.artist === null)!;
+    const named = rows.filter((r): r is typeof r & { artist: string } => r.artist !== null);
+    return { ...this.credit(named), plays: totals.plays, names: totals.tracks };
+  }
+
+  /** Credits each artist name's plays to the artists in it, ranked. */
+  private credit(rows: { artist: string; plays: number; tracks: number; last: number; multi: number }[]) {
     const known = new Map<string, string>();
     const keys = rows.map((r) => {
       const key = r.artist.toLowerCase();
@@ -591,7 +632,6 @@ export class History {
     const byKey = new Map<string, HistoryArtist>();
     // Display names for split-off parts that never appear on their own.
     const extra = new Map<string, string>();
-    const plays = rows[0]?.total ?? 0;
     rows.forEach((r, i) => {
       const names = r.multi ? credits(r.artist, known, extra) : [keys[i]];
       for (const key of names) {
@@ -605,23 +645,7 @@ export class History {
         }
       }
     });
-    // Sort only the page's contenders: everything with at least the page's lowest play count.
-    const all = [...byKey.values()];
-    const counts = Float64Array.from(all, (a) => a.plays).sort().reverse();
-    const floor = counts[Math.min(offset + limit, counts.length) - 1] ?? 0;
-    const ranked = all
-      .filter((a) => a.plays >= floor)
-      .sort((a, b) => b.plays - a.plays || b.lastPlayed - a.lastPlayed);
-    const artists = ranked.slice(offset, offset + limit);
-    if (artists.length) {
-      const cached = await this.sql.all<{ name: string; tidal: string }>(
-        "SELECT name, tidal FROM lastfm_artists WHERE name IN (SELECT value FROM json_each(?))",
-        [JSON.stringify(artists.map((a) => a.name.toLowerCase()))],
-      );
-      const matches = new Map(cached.map((c) => [c.name, c.tidal]));
-      for (const a of artists) a.tidal = decode<Artist>(matches.get(a.name.toLowerCase()));
-    }
-    return { artists, more: all.length > offset + limit, plays };
+    return { all: [...byKey.values()] };
   }
 
   /**

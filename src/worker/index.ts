@@ -60,8 +60,11 @@ const secondsLeft = (props: Props) => Math.max(60, Math.floor((props.expiresAt -
  * so this leaves room for new scrobbles, TIDAL matches and other databases.
  */
 const HISTORY_DAILY_WRITES = 60_000;
-/** Last.fm pages per cron run: one for new scrobbles, two for the backfill. Keeps CPU near the free plan's 10 ms. */
-const HISTORY_PAGES_PER_RUN = 3;
+/**
+ * Last.fm pages per cron run, budgeted separately so a busy day (more than 200 plays to re-read)
+ * can't starve the backfill. About 1 ms of CPU each, against the free plan's 10 ms.
+ */
+const HISTORY_PAGES_PER_RUN = { forward: 2, backfill: 2 };
 
 const d1Sql = new WeakMap<D1Database, Sql>();
 

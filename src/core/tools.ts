@@ -4,7 +4,6 @@ import { z } from "zod";
 import { describeStatus, feedbackStatus, fileIssue, type FeedbackConfig } from "./feedback.js";
 import {
   PERIODS,
-  mergeMatches,
   parseRange,
   type Coverage,
   type History,
@@ -427,7 +426,7 @@ export function createServer(
         const offset = (page - 1) * limit;
         const top = await history.topTracks(r, limit, offset, artist);
         const pending = await history.matchTracks(tidal, top.tracks);
-        const tracks = mergeMatches(top.tracks);
+        const tracks = top.tracks;
         const title = `Top tracks${artist ? ` by ${artist}` : ""}, ${r.label}`;
         const lines = tracks.map((t, i) => `${offset + i + 1}. ${plural(t.plays!, "play")}: ${historyLine(t)}`);
         return result(

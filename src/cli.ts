@@ -41,7 +41,7 @@ async function syncHistory() {
     process.exit(1);
   }
   for (;;) {
-    const c = await history.sync(25);
+    const c = await history.sync({ forward: 25, backfill: 25 });
     const since = c.since ? new Date(c.since * 1000).toISOString().slice(0, 10) : "now";
     console.log(c.complete ? `Done: history imported back to ${since}.` : `Imported back to ${since} (${Math.round((c.progress ?? 0) * 100)}%)...`);
     if (c.complete) return;
