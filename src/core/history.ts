@@ -228,6 +228,8 @@ function loose(s: string): string {
 /** How Last.fm (and TIDAL's scrobbler) join several artists into one name. */
 const ARTIST_SEPARATORS = /( & |, and |, | feat\.? | ft\.? | featuring | x | vs\.? | with )/i;
 
+const NON_ASCII = /[^\x00-\x7f]/;
+
 function artistParts(name: string): string[] {
   return name.split(ARTIST_SEPARATORS).filter((_, i) => i % 2 === 0);
 }
@@ -598,11 +600,11 @@ export class History {
    * Most-played artists in the range, with collaborations credited to each artist.
    *
    * All time is ~10k names, which costs more than the Worker's 10 ms of CPU to receive and credit
-   * in JS. So when a range has over 4,000 names, solo names with fewer than 3 plays are left out
-   * of the first pass: they can't reach the top on their own, and collaborations (always included)
-   * still credit them, minus those one or two solo plays. One approximation remains there: a
-   * collaboration of two such names stays one entry ("A & B") instead of crediting both. A page
-   * that reaches artists with fewer than 3 plays is computed again from every name.
+   * in JS. So when a range has over 4,000 names, the first pass leaves out solo names with fewer
+   * than 3 plays that never appear inside a collaboration: they can't change any other artist's
+   * count or reach the top on their own. (Those that do appear in one are fetched, since they
+   * decide how it splits.) A page that reaches artists with fewer than 3 plays is computed again
+   * from every name.
    */
   async topArtists(range: Range, limit: number, offset: number) {
     const end = offset + limit;
@@ -631,20 +633,21 @@ export class History {
   }
 
   /**
-   * Every artist in the range ranked by credited plays, from names with at least `minPlays` solo
-   * plays (applied only past 4,000 names) plus all collaborations. `plays` and `names` always
-   * cover the whole range.
+   * Every artist in the range ranked by credited plays. Past 4,000 names, solo names with fewer
+   * than `minPlays` plays are included only when they appear inside a collaboration. `plays` and
+   * `names` always cover the whole range.
    */
   private async rankArtists(range: Range, minPlays: number) {
-    const rows = await this.sql.all<{ artist: string | null; plays: number; tracks: number; last: number; multi: number }>(
+    type Row = { artist: string | null; plays: number; tracks: number; last: number; multi: number };
+    const counts = `SELECT track, COUNT(*) AS plays, MAX(uts) AS last FROM lastfm_plays
+                    WHERE uts >= ? AND uts < ? GROUP BY track`;
+    const rows = await this.sql.all<Row>(
       `WITH a AS (
          SELECT t.artist, SUM(c.plays) AS plays, COUNT(*) AS tracks, MAX(c.last) AS last,
                 (t.artist LIKE '% & %' OR t.artist LIKE '%, %' OR t.artist LIKE '% feat%' OR t.artist LIKE '% ft%'
                  OR t.artist LIKE '% featuring %' OR t.artist LIKE '% x %' OR t.artist LIKE '% vs%'
                  OR t.artist LIKE '% with %') AS multi
-         FROM (SELECT track, COUNT(*) AS plays, MAX(uts) AS last FROM lastfm_plays
-               WHERE uts >= ? AND uts < ? GROUP BY track) c
-         JOIN lastfm_tracks t ON t.id = c.track
+         FROM (${counts}) c JOIN lastfm_tracks t ON t.id = c.track
          GROUP BY t.artist)
        -- The totals ride along as one row with no artist.
        SELECT NULL AS artist, COALESCE(SUM(plays), 0) AS plays, COUNT(*) AS tracks, 0 AS last, 0 AS multi FROM a
@@ -654,7 +657,28 @@ export class History {
       [range.from, range.to, minPlays],
     );
     const totals = rows.find((r) => r.artist === null)!;
-    const named = rows.filter((r): r is typeof r & { artist: string } => r.artist !== null);
+    const named = rows.filter((r): r is Row & { artist: string } => r.artist !== null);
+    if (totals.tracks > 4000 && minPlays > 1) {
+      // Solo names left out above still decide how a collaboration splits ("A & B" credits A only
+      // if A appears on its own), so fetch the ones that appear inside a collaboration. Keys use
+      // SQLite's lower(), which only folds ASCII.
+      const fold = (s: string) => (NON_ASCII.test(s) ? s.replace(/[A-Z]+/g, (m) => m.toLowerCase()) : s.toLowerCase());
+      const have = new Set(named.map((r) => fold(r.artist)));
+      const parts = new Set<string>();
+      for (const r of named) {
+        if (r.multi) for (const p of artistParts(r.artist)) if (!have.has(fold(p))) parts.add(fold(p));
+      }
+      if (parts.size) {
+        const extra = await this.sql.all<Row & { artist: string }>(
+          `SELECT t.artist, SUM(c.plays) AS plays, COUNT(*) AS tracks, MAX(c.last) AS last, 0 AS multi
+           FROM (${counts}) c JOIN lastfm_tracks t ON t.id = c.track
+           WHERE lower(t.artist) IN (SELECT value FROM json_each(?))
+           GROUP BY t.artist HAVING SUM(c.plays) < ?`,
+          [range.from, range.to, JSON.stringify([...parts]), minPlays],
+        );
+        named.push(...extra);
+      }
+    }
     return { ...this.credit(named), plays: totals.plays, names: totals.tracks };
   }
 
