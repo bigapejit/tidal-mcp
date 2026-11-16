@@ -28,11 +28,14 @@ CodeRabbit reviews automatically within a few minutes; Codex may review too. Rev
 The PR is ready when CI is green, both rounds are done, and no critical or major finding is open. Don't request a third review: later rounds mostly surface fresh nitpicks on the fixes, and merging is cheaper than chasing them. If a round hasn't come back after 20 minutes, comment `@coderabbitai review` once; if there's still nothing after another 15, proceed without it and say so in the PR.
 
 ## 6. Ship
-1. `gh pr merge <pr> --squash --delete-branch`.
-2. In the root checkout: `git pull --ff-only origin main`, `npm ci`, `npm run deploy`.
-3. Confirm production answers: `curl -s -o /dev/null -w "%{http_code}" -X POST https://tidal-mcp.andrew-618.workers.dev/mcp` returns 401.
-4. If tool names, descriptions or schemas changed, refresh them in ChatGPT (see `AGENTS.md`) using the T3 browser tools, and confirm the page shows no error.
-5. Remove your worktree (`git worktree remove`) and unwatch the PR.
+Other feedback runs can be in flight at the same time, each in its own worktree, so main may have moved since you branched.
+
+1. If the PR conflicts with main or is behind it: `git fetch origin && git rebase origin/main`, resolve conflicts (for `VERSION`, pick one above main's), rerun `npm run check`, and `git push --force-with-lease`. Catching up with main doesn't need another review round.
+2. `gh pr merge <pr> --squash --delete-branch`.
+3. In the root checkout: `git pull --ff-only origin main`, `npm ci`, `npm run deploy`. This deploys all of main, including other runs' merged work, which is what you want. If it fails because another run is deploying at the same moment, wait a minute and retry once.
+4. Confirm production answers: `curl -s -o /dev/null -w "%{http_code}" -X POST https://tidal-mcp.andrew-618.workers.dev/mcp` returns 401.
+5. If tool names, descriptions or schemas changed, refresh them in ChatGPT (see `AGENTS.md`) using the T3 browser tools, and confirm the page shows no error.
+6. Remove your worktree (`git worktree remove`) and unwatch the PR.
 
 Done means: the PR is merged, production serves the new `VERSION`, and ChatGPT has fresh tool definitions if they changed.
 
