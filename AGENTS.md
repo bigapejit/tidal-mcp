@@ -1,0 +1,23 @@
+# tidal-mcp
+
+MCP server for TIDAL playlists. One codebase, two runtimes: `src/core` (runtime-neutral client, tools, inline view) is shared by `src/cli.ts` (local stdio) and `src/worker` (Cloudflare Worker that ChatGPT connects to). Layout and setup are in `README.md`.
+
+## Checking a change
+
+- `npm run check` must pass: both typechecks plus a parse check of the view's script.
+- Live-test tool changes against the real TIDAL API: `npm run build && node scripts/call-tool.mjs <tool> '<json>' [--json]`. It prints timings, which matter here (users notice slow tool chains). The local session in `~/.tidal-mcp` is the owner's real account: read freely, and only create, edit or delete playlists you made for the test, deleting them afterwards.
+
+## Rules no config will tell you
+
+- **Bump `VERSION`** in `src/core/tools.ts` (and `package.json`) for any change to tools or the view. The view's `ui://` URI embeds it, and ChatGPT caches templates by URI, so a stale version means users keep seeing the old view.
+- **The view is a `String.raw` literal** (`src/core/widget.ts`): it must not contain a backtick or `${`. Tool data goes into the DOM through `textContent` only. Its CSP allows images from `https://resources.tidal.com` only, so new image hosts need adding to `resourceDomains` in `tools.ts`.
+- **Tool text is for the model, `structuredContent` is for the view.** Keep text compact. Visual tools end with the view hint so the model doesn't restate the list.
+- **Fewer round trips beat more tools.** If a common request needs two sequential tool calls, give one tool a parameter that does both.
+- **Worker config is secrets, not `vars`**: `TIDAL_CLIENT_ID`, `ALLOWED_TIDAL_USER_IDS`, `GITHUB_TOKEN`, `FEEDBACK_REPO`. A `vars` entry would collide with a secret and clobber it on deploy.
+- **Deploying** is `npm run deploy` from an up-to-date `main` on the owner's machine (Wrangler is logged in there). There is no deploy from CI.
+- **After a deploy that changes tool names, descriptions or schemas,** ChatGPT keeps the old definitions until someone clicks **Refresh tools** at https://chatgpt.com/settings/plugins-settings/plugin_asdk_app_6afa71a11db08191a6d5a70c8ed47cfe (the T3 browser is signed in to ChatGPT).
+- The npm name `tidal-mcp` belongs to an unrelated package; docs should only ever say to run this project from a clone.
+
+## Reviews
+
+CodeRabbit reviews every PR (config in `.coderabbit.yaml`), and CI runs `npm run check` plus a Worker dry-run bundle. Fix every critical or major finding, and anything that could leak tokens, weaken the OAuth checks, or let another TIDAL account connect. Collect remaining minor findings into one follow-up issue linked from the PR.

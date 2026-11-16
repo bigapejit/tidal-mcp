@@ -23,6 +23,19 @@ Clicking a track or playlist opens it in TIDAL. The card follows the host's ligh
 
 The view is one self-contained page (`src/core/widget.ts`) that talks to the host over the MCP Apps postMessage protocol directly, with no bundle or external scripts. Its only network access is TIDAL's image CDN.
 
+## Feedback from chat
+
+Optionally, the server can expose `send_feedback`: tell the assistant "file this as feedback" and it writes up the problem and opens a GitHub issue labeled `feedback`. Enable it with two Worker secrets (or env vars for the local server):
+
+```sh
+npx wrangler secret put FEEDBACK_REPO    # owner/name, e.g. you/tidal-mcp
+npx wrangler secret put GITHUB_TOKEN     # fine-grained token: that one repo, Issues read & write
+```
+
+Issues are public, so the tool tells the model to leave out personal details. Without these secrets the tool doesn't exist.
+
+This repo goes one step further: a GitHub webhook hands each `feedback` issue to a coding agent, which opens a PR. CodeRabbit and CI review the PR, then the agent merges and deploys it.
+
 ## Tools
 
 | Tool | What it does |
@@ -37,6 +50,7 @@ The view is one self-contained page (`src/core/widget.ts`) that talks to the hos
 | `remove_tracks` | Remove tracks from a playlist |
 | `update_playlist` | Rename, re-describe, or change visibility |
 | `delete_playlist` | Delete a playlist (annotated as destructive, so clients ask first) |
+| `send_feedback` | File feedback as a GitHub issue (only when configured, see below) |
 
 ## 1. Create a TIDAL developer app
 

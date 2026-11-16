@@ -17,6 +17,7 @@ import OAuthProvider, {
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { CfWorkerJsonSchemaValidator } from "@modelcontextprotocol/sdk/validation/cfworker";
 import { AUTHORIZE_URL, TIDAL_SCOPES, Tidal, TidalError, pkceChallenge, tidalToken } from "../core/tidal.js";
+import { feedbackConfig } from "../core/feedback.js";
 import { createServer } from "../core/tools.js";
 
 interface Env {
@@ -25,6 +26,9 @@ interface Env {
   TIDAL_CLIENT_SECRET?: string;
   /** Comma-separated TIDAL user ids allowed to connect. Unset: any TIDAL account may. */
   ALLOWED_TIDAL_USER_IDS?: string;
+  /** Optional: enables send_feedback, filing issues on FEEDBACK_REPO ("owner/name"). */
+  GITHUB_TOKEN?: string;
+  FEEDBACK_REPO?: string;
 }
 
 /** What each MCP grant carries (encrypted at rest by the OAuth library). */
@@ -46,7 +50,7 @@ const secondsLeft = (props: Props) => Math.max(60, Math.floor((props.expiresAt -
 // ---------------------------------------------------------------- MCP endpoint
 
 const mcpHandler = {
-  async fetch(request: Request, _env: Env, ctx: ExecutionContext & { props: Props }): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext & { props: Props }): Promise<Response> {
     const props = ctx.props;
     if (Date.now() >= props.expiresAt) {
       // Our token outlived TIDAL's; make the client refresh, which refreshes TIDAL too.
@@ -56,7 +60,11 @@ const mcpHandler = {
       });
     }
     const tidal = new Tidal(async () => props.accessToken, props.countryCode);
-    const server = createServer(tidal, { jsonSchemaValidator: new CfWorkerJsonSchemaValidator() });
+    const server = createServer(
+      tidal,
+      { jsonSchemaValidator: new CfWorkerJsonSchemaValidator() },
+      { feedback: feedbackConfig(env) },
+    );
     // Stateless: every request is self-contained, so no Durable Objects are needed.
     const transport = new WebStandardStreamableHTTPServerTransport({
       sessionIdGenerator: undefined,

@@ -1,0 +1,24 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+language: en-US
+reviews:
+  profile: chill
+  request_changes_workflow: false
+  high_level_summary: true
+  poem: false
+  auto_review:
+    enabled: true
+    drafts: false
+  path_instructions:
+    - path: "src/worker/**"
+      instructions: >-
+        Cloudflare Worker that is also an OAuth authorization server. Flag anything that could leak
+        TIDAL tokens, weaken PKCE/state/consent checks, or let someone other than ALLOWED_TIDAL_USER_IDS connect.
+    - path: "src/core/widget.ts"
+      instructions: >-
+        Inline MCP Apps view as a String.raw literal: it must not contain backticks or "${". Tool data
+        must only reach the DOM through textContent. Changing it requires bumping VERSION in src/core/tools.ts.
+    - path: "src/core/tools.ts"
+      instructions: >-
+        Tool text goes to the model and should stay compact. Visual tools return structuredContent for the view.
+chat:
+  auto_reply: true

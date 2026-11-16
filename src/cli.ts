@@ -2,6 +2,7 @@
 import { parseArgs } from "node:util";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { Tidal } from "./core/tidal.js";
+import { feedbackConfig } from "./core/feedback.js";
 import { createServer } from "./core/tools.js";
 import { getTokens, login, openInBrowser } from "./node/auth.js";
 import {
@@ -16,7 +17,7 @@ import {
 
 async function runServer() {
   const tidal = new Tidal(async () => (await getTokens()).accessToken, (await loadTokens())?.countryCode);
-  await createServer(tidal).connect(new StdioServerTransport());
+  await createServer(tidal, {}, { feedback: feedbackConfig(process.env) }).connect(new StdioServerTransport());
 }
 
 const HELP = `tidal-mcp: an MCP server for managing TIDAL playlists
