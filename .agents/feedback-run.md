@@ -34,10 +34,10 @@ Other feedback runs can be in flight at the same time, each in its own worktree,
 2. `gh pr merge <pr> --squash --delete-branch`.
 3. In the root checkout: `git pull --ff-only origin main`, `npm ci`, `npm run deploy`. This deploys all of main, including other runs' merged work, which is what you want. If it fails because another run is deploying at the same moment, wait a minute and retry once.
 4. Confirm production answers: `curl -s -o /dev/null -w "%{http_code}" -X POST https://tidal-mcp.andrew-618.workers.dev/mcp` returns 401.
-5. If tool names, descriptions or schemas changed, refresh them in ChatGPT (see `AGENTS.md`) using the T3 browser tools, and confirm the page shows no error.
+5. Refresh tools in ChatGPT (see `AGENTS.md`) using the T3 browser tools, and confirm the page shows no error. Do this whenever `VERSION` changed, which is nearly every run: the view URI in the tool definitions embeds it, so skipping the refresh breaks every card.
 6. Remove your worktree (`git worktree remove`) and unwatch the PR.
 
-Done means: the PR is merged, production serves the new `VERSION`, and ChatGPT has fresh tool definitions if they changed.
+Done means: the PR is merged, production serves the new `VERSION`, and ChatGPT has refreshed its tool definitions.
 
 ## 7. Report
 Comment on the issue with what shipped and the version, plus one sentence the owner can say in ChatGPT to try it. Swap `agent:working` for `agent:done`.
