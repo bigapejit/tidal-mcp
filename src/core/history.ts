@@ -418,8 +418,8 @@ export class History {
   async sync(pages: { forward: number; backfill: number }): Promise<Coverage> {
     await this.ready();
     const now = Math.floor(Date.now() / 1000);
-    let s = await this.row();
-    if (!s) {
+    const existing = await this.row();
+    if (!existing) {
       // The backfill covers everything before this moment; syncs cover everything after.
       await this.sql.batch([
         {
@@ -427,8 +427,8 @@ export class History {
           params: [this.lastfm.user, now, now],
         },
       ]);
-      s = (await this.row())!;
     }
+    let s: SyncRow = existing ?? (await this.row())!;
     // New scrobbles first, so recent history stays current while the backfill runs. They aren't
     // budgeted (a day's worth is a few hundred rows) but are counted.
     if (s.fwd_hi === null) [s.fwd_hi, s.fwd_cursor] = [now, now];
@@ -451,23 +451,25 @@ export class History {
         reservation = await this.reserve();
         if (reservation === false) break;
       }
-      s.back_total ??= page.total;
-      s.back_fetched += page.scrobbles.length;
+      // The walk's next position, adopted only once the page is committed.
+      const next: SyncRow = { ...s, back_total: s.back_total ?? page.total, back_fetched: s.back_fetched + page.scrobbles.length };
       if (page.totalPages <= 1) {
-        s.back_done = 1;
-        if (page.scrobbles.length) s.back_cursor = Math.min(s.back_cursor, ...page.scrobbles.map((x) => x.uts));
+        next.back_done = 1;
+        if (page.scrobbles.length) next.back_cursor = Math.min(s.back_cursor, ...page.scrobbles.map((x) => x.uts));
       } else {
-        s.back_cursor = nextCursor(page.scrobbles, s.back_cursor);
+        next.back_cursor = nextCursor(page.scrobbles, s.back_cursor);
       }
-      await this.save(
+      const committed = await this.save(
         page.scrobbles,
         {
           set: `back_cursor = MIN(back_cursor, ?), back_done = MAX(back_done, ?), back_total = ?, back_fetched = ?,
                 synced_at = ?`,
-          params: [s.back_cursor, s.back_done, s.back_total, s.back_fetched, Date.now()],
+          params: [next.back_cursor, next.back_done, next.back_total, next.back_fetched, Date.now()],
         },
         reservation,
       );
+      if (!committed) break; // midnight passed before the commit; the page is retried on the new day's budget
+      s = next;
     }
 
     s.synced_at = Date.now();
@@ -499,12 +501,16 @@ export class History {
    * Stores a page of scrobbles, the walk's new position, and the rows the page wrote, in one
    * transaction: SQLite's changes() counts each insert as the next statement runs. A backfill page
    * swaps its reservation for that count; the reservation's own UPDATE stays counted.
+   *
+   * A reserved page commits only while the database's own clock is still on the reservation's
+   * UTC day: every statement carries that condition, so a page that would land after midnight
+   * writes nothing and is retried against the new day's budget. Resolves to whether it committed.
    */
   private async save(
     scrobbles: Scrobble[],
     position: { set: string; params: unknown[] },
     reservation?: { day: string; rows: number },
-  ): Promise<void> {
+  ): Promise<boolean> {
     const tracks = new Map<number, { id: number; artist: string; title: string; album: string | null }>();
     const plays: { uts: number; id: number }[] = [];
     for (const s of scrobbles) {
@@ -512,38 +518,41 @@ export class History {
       if (!tracks.has(id)) tracks.set(id, { id, artist: s.artist, title: s.title, album: s.album ?? null });
       plays.push({ uts: s.uts, id });
     }
-    const day = utcDay();
-    // The page's real count replaces its claim; the claim's own UPDATE row stays counted. A claim
-    // from before midnight UTC belongs to yesterday's count, which this page doesn't touch.
-    const release = reservation?.day === day ? reservation.rows - 1 : 0;
+    const day = reservation?.day ?? utcDay();
+    const onDay = reservation?.day ?? null;
+    const guard = "(? IS NULL OR date('now') = ?)";
     // json_each keeps a whole page to one statement each, well under D1's 100 bound parameters.
-    await this.sql.batch([
+    const written = await this.sql.batch([
       {
         sql: `INSERT INTO lastfm_tracks (id, artist, title, album)
               SELECT json_extract(value, '$.id'), json_extract(value, '$.artist'), json_extract(value, '$.title'),
                      json_extract(value, '$.album')
-              FROM json_each(?) WHERE true
+              FROM json_each(?) WHERE ${guard}
               ON CONFLICT (id) DO UPDATE SET album = excluded.album
               WHERE lastfm_tracks.album IS NULL AND excluded.album IS NOT NULL`,
-        params: [JSON.stringify([...tracks.values()])],
+        params: [JSON.stringify([...tracks.values()]), onDay, onDay],
       },
       {
         // changes(): the tracks just written. +1 for this UPDATE.
         sql: `UPDATE lastfm_sync SET day_writes = (CASE WHEN day = ? THEN day_writes ELSE 0 END) + changes() + 1,
-                day = ? WHERE id = 1`,
-        params: [day, day],
+                day = ? WHERE id = 1 AND ${guard}`,
+        params: [day, day, onDay, onDay],
       },
       {
         sql: `INSERT OR IGNORE INTO lastfm_plays (uts, track)
-              SELECT json_extract(value, '$.uts'), json_extract(value, '$.id') FROM json_each(?)`,
-        params: [JSON.stringify(plays)],
+              SELECT json_extract(value, '$.uts'), json_extract(value, '$.id') FROM json_each(?) WHERE ${guard}`,
+        params: [JSON.stringify(plays), onDay, onDay],
       },
       {
-        // changes(): the plays just written. +1 for this UPDATE, minus the settled reservation.
-        sql: `UPDATE lastfm_sync SET day_writes = MAX(0, day_writes + changes() + 1 - ?), ${position.set} WHERE id = 1`,
-        params: [release, ...position.params],
+        // changes(): the plays just written. +1 for this UPDATE; the claim, minus its own row, is
+        // replaced by the page's real count.
+        sql: `UPDATE lastfm_sync SET day_writes = MAX(0, day_writes + changes() + 1 - ?), ${position.set}
+              WHERE id = 1 AND ${guard}`,
+        params: [reservation ? reservation.rows - 1 : 0, ...position.params, onDay, onDay],
       },
     ]);
+    // The last UPDATE always writes its row when the page commits.
+    return written > 0;
   }
 
   /**

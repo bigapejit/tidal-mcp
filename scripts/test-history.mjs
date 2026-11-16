@@ -130,4 +130,29 @@ await check("a page fetched across midnight claims against the new day, or waits
     assert.ok(s.day_writes <= 2_000, `day_writes ${s.day_writes}`);
   } finally { globalThis.Date = RealDate; }
 });
+await check("a page that would commit after midnight by the database's clock writes nothing, then is retried", async () => {
+  const sql = memSql();
+  // Pages follow the cursor, so a skipped page would show up as a gap.
+  const lf = { user: "u", async recent({ from, to }) {
+    if (from) return { scrobbles: [], total: 0, totalPages: 0 };
+    const scrobbles = Array.from({ length: 200 }, (_, i) => ({ uts: to - 1 - i, artist: `Artist ${to - 1 - i}`, title: "T" }));
+    return { scrobbles, total: 1e6, totalPages: 5000 };
+  } };
+  const h = new History(sql, lf, { dailyWrites: 100_000 });
+  await h.sync({ forward: 1, backfill: 0 });
+  const [{ back_cursor: start }] = await sql.all("SELECT back_cursor FROM lastfm_sync");
+  // The JS clock (which made the reservation) is on another day than SQLite's date('now').
+  const RealDate = Date;
+  const other = RealDate.parse("2030-01-01T12:00:00Z");
+  globalThis.Date = class extends RealDate { constructor(...a) { super(...(a.length ? a : [other])); } static now() { return other; } };
+  try {
+    await h.sync({ forward: 0, backfill: 2 });
+  } finally { globalThis.Date = RealDate; }
+  const [skipped] = await sql.all("SELECT back_cursor, back_fetched, (SELECT COUNT(*) FROM lastfm_plays) AS plays FROM lastfm_sync");
+  assert.deepEqual([skipped.back_cursor, skipped.back_fetched, skipped.plays], [start, 0, 0]);
+  await h.sync({ forward: 0, backfill: 1 });
+  const [after] = await sql.all("SELECT back_fetched, (SELECT COUNT(*) FROM lastfm_plays) AS plays, (SELECT MAX(uts) FROM lastfm_plays) AS newest FROM lastfm_sync");
+  assert.deepEqual([after.back_fetched, after.plays, after.newest], [200, 200, start]);
+});
+
 console.log(`${ok} passed`);
