@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 import { parseArgs } from "node:util";
-import { login, openInBrowser } from "./auth.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { Tidal } from "./core/tidal.js";
+import { createServer } from "./core/tools.js";
+import { getTokens, login, openInBrowser } from "./node/auth.js";
 import {
   DEFAULT_PORT,
   clearAll,
@@ -9,8 +12,12 @@ import {
   loadTokens,
   redirectUri,
   saveSettings,
-} from "./config.js";
-import { runServer } from "./server.js";
+} from "./node/config.js";
+
+async function runServer() {
+  const tidal = new Tidal(async () => (await getTokens()).accessToken, (await loadTokens())?.countryCode);
+  await createServer(tidal).connect(new StdioServerTransport());
+}
 
 const HELP = `tidal-mcp: an MCP server for managing TIDAL playlists
 

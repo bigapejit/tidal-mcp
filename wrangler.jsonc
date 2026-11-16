@@ -1,0 +1,18 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "tidal-mcp",
+  "main": "src/worker/index.ts",
+  "compatibility_date": "2026-11-01",
+  // global_fetch_strictly_public: lets clients identify themselves with a metadata URL (CIMD) safely.
+  "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
+  "workers_dev": true,
+  "observability": { "enabled": true },
+  // Holds OAuth grants. Wrangler creates the namespace on first deploy.
+  "kv_namespaces": [{ "binding": "OAUTH_KV" }],
+  "vars": {
+    // Your app's client id from https://developer.tidal.com/dashboard (not a secret).
+    "TIDAL_CLIENT_ID": "",
+    // Comma-separated TIDAL user ids allowed to connect. Leave empty to allow any TIDAL account.
+    "ALLOWED_TIDAL_USER_IDS": ""
+  }
+}

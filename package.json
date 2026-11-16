@@ -5,8 +5,8 @@
   "scripts": {
     "build": "tsc",
     "prepare": "tsc",
-    "start": "node dist/index.js",
-    "login": "node dist/index.js login"
+    "start": "node dist/cli.js",
+    "login": "node dist/cli.js login"
   },
   "keywords": [
     "mcp",
@@ -17,15 +17,19 @@
   "license": "MIT",
   "type": "module",
   "dependencies": {
+    "@cloudflare/workers-oauth-provider": "^1.2.4",
     "@modelcontextprotocol/sdk": "^1.32.2",
+    "agents": "^0.33.0",
     "zod": "^4.6.7"
   },
   "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261116.1",
     "@types/node": "^26.6.6",
-    "typescript": "^7.0.2"
+    "typescript": "^7.0.2",
+    "wrangler": "^4.162.0"
   },
   "bin": {
-    "tidal-mcp": "dist/index.js"
+    "tidal-mcp": "dist/cli.js"
   },
   "files": [
     "dist"

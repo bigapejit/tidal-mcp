@@ -1,47 +1,10 @@
 import { spawn } from "node:child_process";
-import { createHash, randomBytes } from "node:crypto";
+import { randomBytes } from "node:crypto";
 import { createServer } from "node:http";
-import {
-  AUTHORIZE_URL,
-  SCOPES,
-  TOKEN_URL,
-  loadSettings,
-  loadTokens,
-  saveTokens,
-  type Settings,
-  type Tokens,
-} from "./config.js";
+import { AUTHORIZE_URL, TIDAL_SCOPES, pkceChallenge, tidalToken, type TidalTokenResponse } from "../core/tidal.js";
+import { loadSettings, loadTokens, saveTokens, type Settings, type Tokens } from "./config.js";
 
-const base64url = (buf: Buffer) => buf.toString("base64url");
-
-interface TokenResponse {
-  access_token: string;
-  refresh_token?: string;
-  expires_in: number;
-  scope?: string;
-  user_id?: number | string;
-  user?: { userId?: number | string; countryCode?: string };
-  error?: string;
-  error_description?: string;
-}
-
-async function requestToken(settings: Settings, params: Record<string, string>): Promise<TokenResponse> {
-  const headers: Record<string, string> = { "Content-Type": "application/x-www-form-urlencoded" };
-  const body = new URLSearchParams({ client_id: settings.clientId, ...params });
-  if (settings.clientSecret) {
-    headers.Authorization =
-      "Basic " + Buffer.from(`${settings.clientId}:${settings.clientSecret}`).toString("base64");
-  }
-  const res = await fetch(TOKEN_URL, { method: "POST", headers, body });
-  const json = (await res.json().catch(() => ({}))) as TokenResponse;
-  if (!res.ok || !json.access_token) {
-    const reason = json.error_description ?? json.error ?? `HTTP ${res.status}`;
-    throw new Error(`TIDAL token request failed: ${reason}`);
-  }
-  return json;
-}
-
-function toTokens(json: TokenResponse, previous?: Tokens): Tokens {
+function toTokens(json: TidalTokenResponse, previous?: Tokens): Tokens {
   const userId = json.user_id ?? json.user?.userId;
   return {
     accessToken: json.access_token,
@@ -57,7 +20,7 @@ function toTokens(json: TokenResponse, previous?: Tokens): Tokens {
 
 let refreshing: Promise<Tokens> | undefined;
 
-/** Returns a valid access token, refreshing it when needed. */
+/** Returns valid tokens, refreshing them when needed. */
 export async function getTokens(): Promise<Tokens> {
   const settings = await loadSettings();
   const tokens = await loadTokens();
@@ -65,13 +28,8 @@ export async function getTokens(): Promise<Tokens> {
     throw new Error("Not signed in to TIDAL. Run `tidal-mcp login --client-id <id>` in a terminal first (see the README).");
   }
   if (Date.now() < tokens.expiresAt) return tokens;
-  if (!tokens.refreshToken) {
-    throw new Error("TIDAL session expired. Run `tidal-mcp login` again.");
-  }
-  refreshing ??= requestToken(settings, {
-    grant_type: "refresh_token",
-    refresh_token: tokens.refreshToken,
-  })
+  if (!tokens.refreshToken) throw new Error("TIDAL session expired. Run `tidal-mcp login` again.");
+  refreshing ??= tidalToken(settings, { grant_type: "refresh_token", refresh_token: tokens.refreshToken })
     .then(async (json) => {
       const next = toTokens(json, tokens);
       await saveTokens(next);
@@ -99,18 +57,17 @@ export function openInBrowser(url: string): void {
  */
 export async function login(settings: Settings, onUrl: (url: string) => void): Promise<Tokens> {
   const redirect = new URL(settings.redirectUri);
-  const verifier = base64url(randomBytes(32));
-  const challenge = base64url(createHash("sha256").update(verifier).digest());
-  const state = base64url(randomBytes(16));
+  const verifier = randomBytes(32).toString("base64url");
+  const state = randomBytes(16).toString("base64url");
 
   const authUrl = new URL(AUTHORIZE_URL);
   authUrl.search = new URLSearchParams({
     response_type: "code",
     client_id: settings.clientId,
     redirect_uri: settings.redirectUri,
-    scope: SCOPES.join(" "),
+    scope: TIDAL_SCOPES.join(" "),
     code_challenge_method: "S256",
-    code_challenge: challenge,
+    code_challenge: await pkceChallenge(verifier),
     state,
   }).toString();
 
@@ -121,7 +78,7 @@ export async function login(settings: Settings, onUrl: (url: string) => void): P
         res.writeHead(404).end();
         return;
       }
-      const finish = (status: number, message: string, result: () => void) => {
+      const finish = (status: number, message: string, settle: () => void) => {
         res.writeHead(status, { "Content-Type": "text/html; charset=utf-8" });
         res.end(
           `<!doctype html><meta charset="utf-8"><title>TIDAL MCP</title>` +
@@ -129,7 +86,7 @@ export async function login(settings: Settings, onUrl: (url: string) => void): P
             `<p>${message}</p></body>`,
         );
         server.close();
-        result();
+        settle();
       };
       const error = url.searchParams.get("error");
       if (error) {
@@ -145,9 +102,7 @@ export async function login(settings: Settings, onUrl: (url: string) => void): P
       }
       const got = url.searchParams.get("code");
       if (!got) {
-        return finish(400, "No authorization code received.", () =>
-          reject(new Error("Callback had no authorization code.")),
-        );
+        return finish(400, "No authorization code received.", () => reject(new Error("Callback had no code.")));
       }
       finish(200, "Signed in to TIDAL. You can close this tab.", () => resolve(got));
     });
@@ -155,7 +110,7 @@ export async function login(settings: Settings, onUrl: (url: string) => void): P
     server.listen(Number(redirect.port || 80), "127.0.0.1", () => onUrl(authUrl.toString()));
   });
 
-  const json = await requestToken(settings, {
+  const json = await tidalToken(settings, {
     grant_type: "authorization_code",
     code,
     redirect_uri: settings.redirectUri,

@@ -2,18 +2,6 @@ import { chmod, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-export const AUTHORIZE_URL = "https://login.tidal.com/authorize";
-export const TOKEN_URL = "https://auth.tidal.com/v1/oauth2/token";
-export const API_BASE = "https://openapi.tidal.com/v2";
-
-export const SCOPES = [
-  "user.read",
-  "search.read",
-  "playlists.read",
-  "playlists.write",
-  "collection.read",
-];
-
 export const DEFAULT_PORT = 8765;
 
 export function redirectUri(port: number): string {

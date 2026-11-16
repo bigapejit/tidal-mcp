@@ -1,10 +1,9 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import type { ServerOptions } from "@modelcontextprotocol/sdk/server/index.js";
 import { z } from "zod";
-import * as tidal from "./tidal.js";
-import type { Track } from "./tidal.js";
+import type { Tidal, Track } from "./tidal.js";
 
-const VERSION = "0.1.0";
+export const VERSION = "0.2.0";
 
 const trackId = z.string().regex(/^\d+$/, "TIDAL track ids are numeric");
 const playlistId = z.string().min(1).describe("Playlist id (a UUID from list_my_playlists or create_playlist)");
@@ -27,10 +26,12 @@ function safe<A>(fn: (args: A) => Promise<ReturnType<typeof text>>) {
   };
 }
 
-export function buildServer(): McpServer {
+/** An MCP server exposing the playlist tools, bound to one signed-in TIDAL user. */
+export function createServer(tidal: Tidal, options: Omit<ServerOptions, "instructions"> = {}): McpServer {
   const server = new McpServer(
     { name: "tidal-mcp", version: VERSION },
     {
+      ...options,
       instructions:
         "Manage the user's TIDAL playlists. To build a playlist from song names, call find_tracks with " +
         "'Artist - Title' strings, check the matches, then create_playlist with the track ids. " +
@@ -217,6 +218,3 @@ export function buildServer(): McpServer {
   return server;
 }
 
-export async function runServer(): Promise<void> {
-  await buildServer().connect(new StdioServerTransport());
-}
