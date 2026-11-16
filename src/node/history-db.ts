@@ -21,8 +21,7 @@ export async function openHistoryDb(): Promise<Sql> {
     async batch(statements) {
       db.exec("BEGIN IMMEDIATE");
       try {
-        let written = 0;
-        for (const s of statements) written += Number(db.prepare(s.sql).run(...args(s.params)).changes);
+        const written = statements.map((s) => Number(db.prepare(s.sql).run(...args(s.params)).changes));
         db.exec("COMMIT");
         return written;
       } catch (err) {

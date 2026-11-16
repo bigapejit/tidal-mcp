@@ -17,7 +17,7 @@ function memSql() {
   return {
     db,
     async all(sql, params = []) { return db.prepare(sql).all(...params).map((r) => ({ ...r })); },
-    async batch(stmts) { db.exec("BEGIN"); try { let n = 0; for (const s of stmts) n += Number(db.prepare(s.sql).run(...(s.params ?? [])).changes); db.exec("COMMIT"); return n; } catch (e) { db.exec("ROLLBACK"); throw e; } },
+    async batch(stmts) { db.exec("BEGIN"); try { const n = stmts.map((s) => Number(db.prepare(s.sql).run(...(s.params ?? [])).changes)); db.exec("COMMIT"); return n; } catch (e) { db.exec("ROLLBACK"); throw e; } },
   };
 }
 const all = parseRange({});
@@ -81,14 +81,15 @@ function fakeLastFm(onFetch) {
 }
 const state = async (sql) => (await sql.all("SELECT day_writes, day, back_fetched FROM lastfm_sync"))[0];
 
-await check("a claim includes its own row: 402 rows left is not enough for a page", async () => {
+// A full page writes 200 tracks, 200 plays and 3 state rows; its claim adds its own row: 404.
+await check("a claim covers a full page plus its own row: 403 rows left is not enough", async () => {
   const sql = memSql();
   const h = new History(sql, fakeLastFm(), { dailyWrites: 10_000 });
   await h.sync({ forward: 1, backfill: 0 });
-  sql.db.prepare("UPDATE lastfm_sync SET day_writes = ?").run(10_000 - 402);
+  sql.db.prepare("UPDATE lastfm_sync SET day_writes = ?").run(10_000 - 403);
   await h.sync({ forward: 0, backfill: 3 });
   assert.equal((await state(sql)).back_fetched, 0);
-  sql.db.prepare("UPDATE lastfm_sync SET day_writes = ?").run(10_000 - 403);
+  sql.db.prepare("UPDATE lastfm_sync SET day_writes = ?").run(10_000 - 404);
   await h.sync({ forward: 0, backfill: 3 });
   const s = await state(sql);
   assert.equal(s.back_fetched, 200);
@@ -153,6 +154,37 @@ await check("a page that would commit after midnight by the database's clock wri
   await h.sync({ forward: 0, backfill: 1 });
   const [after] = await sql.all("SELECT back_fetched, (SELECT COUNT(*) FROM lastfm_plays) AS plays, (SELECT MAX(uts) FROM lastfm_plays) AS newest FROM lastfm_sync");
   assert.deepEqual([after.back_fetched, after.plays, after.newest], [200, 200, start]);
+});
+
+// Midnight between the statements of one commit: SQLite's date() is replaced so its first call
+// returns `first` and every later call returns another day.
+async function midBatchMidnight(first) {
+  const sql = memSql();
+  const lf = { user: "u", async recent({ from, to }) {
+    if (from) return { scrobbles: [], total: 0, totalPages: 0 };
+    const scrobbles = Array.from({ length: 200 }, (_, i) => ({ uts: to - 1 - i, artist: `Artist ${to - 1 - i}`, title: "T" }));
+    return { scrobbles, total: 1e6, totalPages: 5000 };
+  } };
+  const h = new History(sql, lf, { dailyWrites: 100_000 });
+  await h.sync({ forward: 1, backfill: 0 });
+  const [{ back_cursor: start }] = await sql.all("SELECT back_cursor FROM lastfm_sync");
+  let calls = 0;
+  sql.db.function("date", { varargs: true }, () => (calls++ === 0 ? first : "2099-01-01"));
+  await h.sync({ forward: 0, backfill: 1 });
+  const [r] = await sql.all(`SELECT back_cursor, back_fetched, (SELECT COUNT(*) FROM lastfm_plays) AS plays,
+                               (SELECT COUNT(*) FROM lastfm_tracks) AS tracks FROM lastfm_sync`);
+  return { start, ...r };
+}
+
+await check("midnight between a commit's statements: the page is stored whole", async () => {
+  const r = await midBatchMidnight(new Date().toISOString().slice(0, 10));
+  assert.deepEqual([r.plays, r.tracks, r.back_fetched], [200, 200, 200]);
+  assert.ok(r.back_cursor < r.start, "cursor didn't move");
+});
+
+await check("past midnight at a commit's first statement: nothing is stored, not even tracks", async () => {
+  const r = await midBatchMidnight("2099-01-01");
+  assert.deepEqual([r.plays, r.tracks, r.back_fetched, r.back_cursor], [0, 0, 0, r.start]);
 });
 
 console.log(`${ok} passed`);

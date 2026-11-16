@@ -81,7 +81,7 @@ function history(env: Env, ctx?: ExecutionContext): History | undefined {
       },
       async batch(statements) {
         const results = await db.batch(statements.map((s) => db.prepare(s.sql).bind(...(s.params ?? []))));
-        return results.reduce((n, r) => n + (r.meta.rows_written ?? r.meta.changes ?? 0), 0);
+        return results.map((r) => r.meta.rows_written ?? r.meta.changes ?? 0);
       },
     };
     d1Sql.set(db, sql);

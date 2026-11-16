@@ -25,8 +25,8 @@ export interface SqlStatement {
 /** The part of a SQL database this module uses. D1 and node:sqlite both provide it. */
 export interface Sql {
   all<T>(sql: string, params?: unknown[]): Promise<T[]>;
-  /** Runs the statements in one transaction and one round trip. Resolves to the rows written. */
-  batch(statements: SqlStatement[]): Promise<number>;
+  /** Runs the statements in one transaction and one round trip. Resolves to the rows each wrote. */
+  batch(statements: SqlStatement[]): Promise<number[]>;
 }
 
 /** Each sync re-reads the last day, because scrobbles from offline listening arrive late. */
@@ -44,8 +44,8 @@ const MATCH_LATER = 10;
 const MATCH_LATER_PACE_MS = 1200;
 /** An end time later than any scrobble. */
 const FOREVER = 10_000_000_000;
-/** Most rows one Last.fm page can write: a track and a play per scrobble, plus two state updates. */
-const PAGE_WRITES = 200 * 2 + 2;
+/** Most rows one Last.fm page can write: a track and a play per scrobble, plus three state updates. */
+const PAGE_WRITES = 200 * 2 + 3;
 
 /** The UTC day D1's daily limits count against. */
 const utcDay = () => new Date().toISOString().slice(0, 10);
@@ -70,6 +70,7 @@ const SCHEMA = [
     back_done INTEGER NOT NULL DEFAULT 0,
     back_total INTEGER,
     back_fetched INTEGER NOT NULL DEFAULT 0,
+    page_ok INTEGER NOT NULL DEFAULT 0,
     synced_at INTEGER,
     day TEXT,
     day_writes INTEGER NOT NULL DEFAULT 0)`,
@@ -494,7 +495,7 @@ export class History {
         params: [day, rows, day, day, rows, this.dailyWrites],
       },
     ]);
-    return claimed > 0 && { day, rows };
+    return claimed[0] > 0 && { day, rows };
   }
 
   /**
@@ -503,8 +504,10 @@ export class History {
    * swaps its reservation for that count; the reservation's own UPDATE stays counted.
    *
    * A reserved page commits only while the database's own clock is still on the reservation's
-   * UTC day: every statement carries that condition, so a page that would land after midnight
-   * writes nothing and is retried against the new day's budget. Resolves to whether it committed.
+   * UTC day, so a page that would land after midnight writes nothing and is retried against the
+   * new day's budget. date('now') can change between statements, so the first statement decides
+   * once (into page_ok) and every later statement follows that decision: all or nothing.
+   * Resolves to whether the page committed.
    */
   private async save(
     scrobbles: Scrobble[],
@@ -520,39 +523,43 @@ export class History {
     }
     const day = reservation?.day ?? utcDay();
     const onDay = reservation?.day ?? null;
-    const guard = "(? IS NULL OR date('now') = ?)";
+    const admitted = "(SELECT page_ok FROM lastfm_sync WHERE id = 1) = 1";
     // json_each keeps a whole page to one statement each, well under D1's 100 bound parameters.
     const written = await this.sql.batch([
+      {
+        sql: "UPDATE lastfm_sync SET page_ok = (? IS NULL OR date('now') = ?) WHERE id = 1",
+        params: [onDay, onDay],
+      },
       {
         sql: `INSERT INTO lastfm_tracks (id, artist, title, album)
               SELECT json_extract(value, '$.id'), json_extract(value, '$.artist'), json_extract(value, '$.title'),
                      json_extract(value, '$.album')
-              FROM json_each(?) WHERE ${guard}
+              FROM json_each(?) WHERE ${admitted}
               ON CONFLICT (id) DO UPDATE SET album = excluded.album
               WHERE lastfm_tracks.album IS NULL AND excluded.album IS NOT NULL`,
-        params: [JSON.stringify([...tracks.values()]), onDay, onDay],
+        params: [JSON.stringify([...tracks.values()])],
       },
       {
-        // changes(): the tracks just written. +1 for this UPDATE.
-        sql: `UPDATE lastfm_sync SET day_writes = (CASE WHEN day = ? THEN day_writes ELSE 0 END) + changes() + 1,
-                day = ? WHERE id = 1 AND ${guard}`,
-        params: [day, day, onDay, onDay],
+        // changes(): the tracks just written. +2 for this UPDATE and the page_ok one.
+        sql: `UPDATE lastfm_sync SET day_writes = (CASE WHEN day = ? THEN day_writes ELSE 0 END) + changes() + 2,
+                day = ? WHERE id = 1 AND page_ok = 1`,
+        params: [day, day],
       },
       {
         sql: `INSERT OR IGNORE INTO lastfm_plays (uts, track)
-              SELECT json_extract(value, '$.uts'), json_extract(value, '$.id') FROM json_each(?) WHERE ${guard}`,
-        params: [JSON.stringify(plays), onDay, onDay],
+              SELECT json_extract(value, '$.uts'), json_extract(value, '$.id') FROM json_each(?) WHERE ${admitted}`,
+        params: [JSON.stringify(plays)],
       },
       {
         // changes(): the plays just written. +1 for this UPDATE; the claim, minus its own row, is
         // replaced by the page's real count.
         sql: `UPDATE lastfm_sync SET day_writes = MAX(0, day_writes + changes() + 1 - ?), ${position.set}
-              WHERE id = 1 AND ${guard}`,
-        params: [reservation ? reservation.rows - 1 : 0, ...position.params, onDay, onDay],
+              WHERE id = 1 AND page_ok = 1`,
+        params: [reservation ? reservation.rows - 1 : 0, ...position.params],
       },
     ]);
-    // The last UPDATE always writes its row when the page commits.
-    return written > 0;
+    // The final UPDATE writes its row exactly when the page was admitted and stored.
+    return written[written.length - 1] > 0;
   }
 
   /**
