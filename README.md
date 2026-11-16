@@ -41,7 +41,7 @@ This repo goes one step further: a GitHub webhook hands each `feedback` issue to
 
 TIDAL's API has no listening history, but TIDAL can scrobble to [Last.fm](https://www.last.fm). With a Last.fm account connected to TIDAL, the server adds `listening_history`, `top_tracks` and `top_artists`. They answer "what did I play last week", "my most-played Khruangbin songs" and "who did I listen to most in 2024" with real play counts, and match tracks and artists to TIDAL so the results can go straight into a playlist.
 
-Scrobbles are copied into a database (Cloudflare D1 on the Worker, SQLite locally), so a ranking over years of history is one query. A song counts once in `top_tracks` however TIDAL credited it ("Khruangbin & Leon Bridges" or just "Khruangbin"). TIDAL matches are cached after the first lookup.
+Scrobbles are copied into a database (Cloudflare D1 on the Worker, SQLite locally), so a ranking over years of history is one query. A song counts once in `top_tracks` across credits that start with the same artist ("Khruangbin & Leon Bridges", "Khruangbin, Leon Bridges" or just "Khruangbin"); a credit in another order, like "Leon Bridges & Khruangbin", counts separately. TIDAL matches are cached after the first lookup.
 
 **Remote:** set two Worker secrets ([get an API key](https://www.last.fm/api/account/create)):
 

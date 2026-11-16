@@ -282,7 +282,7 @@ await check("top tracks' artist filter is a literal, case-insensitive substring 
   assert.deepEqual(names(await h.topTracks(all, 10, 0, "leon BRIDGES")), ["Khruangbin & Leon Bridges - Mariella:2"]);
   assert.deepEqual(names(await h.topTracks(all, 10, 0, "_100%")), ["DJ_100% - Track:1"]);
   assert.deepEqual(names(await h.topTracks(all, 10, 0, "%")), ["DJ_100% - Track:1"]);
-  assert.deepEqual(names(await h.topTracks(all, 10, 0, "Whose Name Runs Well Past Fifty Bytes Of Pattern")), [
+  assert.deepEqual(names(await h.topTracks(all, 10, 0, "A Band Whose Name Runs Well Past Fifty Bytes Of Pattern")), [
     "A Band Whose Name Runs Well Past Fifty Bytes Of Pattern - Long:1",
   ]);
 });

@@ -185,6 +185,7 @@ ${d.redirectIsLoopback ? `<p class="warn"><strong>This sends access to an app on
 <p>Next you'll sign in to TIDAL.</p>
 <form method="post">
   <input type="hidden" name="handle" value="${escape(handle)}">
+  ${withHistory ? '<input type="hidden" name="history" value="shown">' : ""}
   <div class="row">
     <button name="decision" value="deny">Cancel</button>
     <button class="primary" name="decision" value="approve">Continue to TIDAL</button>
@@ -223,9 +224,12 @@ const signIn = {
           return new Response(null, { status: 302, headers: denied.headers });
         }
         const approved = await oauth.approveConsent(request, handle);
+        // Whether the page approved listed listening history: an older page, or one shown before
+        // history was set up, didn't. Kept in the upstream state, which only this server can read.
+        const history = form.get("history") === "shown" && historyOffered(env);
         const verifier = crypto.randomUUID() + crypto.randomUUID();
         const { state, headers } = await oauth.beginUpstream(approved.request, {
-          data: { verifier },
+          data: { verifier, history },
           headers: approved.headers,
         });
         const tidalUrl = new URL(AUTHORIZE_URL);
@@ -242,7 +246,7 @@ const signIn = {
       }
 
       if (url.pathname === "/callback") {
-        const { request: original, data, headers } = await oauth.finishUpstream<{ verifier: string }>(request);
+        const { request: original, data, headers } = await oauth.finishUpstream<{ verifier: string; history?: boolean }>(request);
         const code = url.searchParams.get("code");
         if (url.searchParams.get("error") || !code) {
           return redirect(authorizationErrorRedirect(original, "access_denied"), headers);
@@ -264,8 +268,7 @@ const signIn = {
           accessToken: token.access_token,
           refreshToken: token.refresh_token,
           expiresAt: Date.now() + token.expires_in * 1000,
-          // The consent page just shown listed history exactly when it is offered.
-          historyConsent: historyOffered(env),
+          historyConsent: data.history === true,
         };
         const { redirectTo } = await oauth.completeAuthorization({
           request: original,
