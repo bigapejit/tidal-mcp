@@ -8,11 +8,8 @@
   "workers_dev": true,
   "observability": { "enabled": true },
   // Holds OAuth grants. Wrangler creates the namespace on first deploy.
-  "kv_namespaces": [{ "binding": "OAUTH_KV" }],
-  "vars": {
-    // Your app's client id from https://developer.tidal.com/dashboard (not a secret).
-    "TIDAL_CLIENT_ID": "",
-    // Comma-separated TIDAL user ids allowed to connect. Leave empty to allow any TIDAL account.
-    "ALLOWED_TIDAL_USER_IDS": ""
-  }
+  "kv_namespaces": [{ "binding": "OAUTH_KV" }]
+  // Configuration is set as secrets, so it survives redeploys and stays out of the repo:
+  //   npx wrangler secret put TIDAL_CLIENT_ID          your TIDAL app's client id
+  //   npx wrangler secret put ALLOWED_TIDAL_USER_IDS   optional; your TIDAL user id, to lock the server to you
 }

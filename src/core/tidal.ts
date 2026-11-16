@@ -120,7 +120,11 @@ export class Tidal {
     opts: { query?: Record<string, string | undefined>; body?: unknown } = {},
   ): Promise<Document | undefined> {
     const url = new URL(path.startsWith("http") ? path : API_BASE + path);
-    for (const [k, v] of Object.entries(opts.query ?? {})) if (v !== undefined) url.searchParams.set(k, v);
+    // Encode with %20, not URLSearchParams' "+", so a literal "+" in a search survives.
+    const extra = Object.entries(opts.query ?? {})
+      .filter(([, v]) => v !== undefined)
+      .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v!)}`);
+    if (extra.length) url.search = [url.search.slice(1), ...extra].filter(Boolean).join("&");
 
     const headers: Record<string, string> = {
       Authorization: `Bearer ${await this.accessToken()}`,
@@ -203,11 +207,11 @@ export class Tidal {
   }
 
   async searchTracks(query: string, limit: number): Promise<Track[]> {
-    const doc = await this.request("GET", `/searchResults/${encodeURIComponent(query)}/relationships/tracks`, {
-      query: { countryCode: await this.country(), explicitFilter: "INCLUDE" },
+    const doc = await this.request("GET", "/searchResults", {
+      query: { "filter[query]": query, countryCode: await this.country(), explicitFilter: "INCLUDE", include: "tracks" },
     });
-    const hits = ((doc?.data as Identifier[]) ?? []).slice(0, limit).map((d) => d.id);
-    return this.getTracks(hits);
+    const result = (Array.isArray(doc?.data) ? doc.data[0] : doc?.data) as Resource | undefined;
+    return this.getTracks(ids(result?.relationships?.tracks).slice(0, limit));
   }
 
   async similarTracks(trackId: string, limit: number): Promise<Track[]> {
