@@ -51,7 +51,7 @@ npx wrangler secret put ALLOWED_TIDAL_USER_IDS       # optional: your TIDAL user
 
 Add `https://<your-worker>.workers.dev/callback` to your TIDAL app's redirect URIs. Your MCP URL is `https://<your-worker>.workers.dev/mcp`.
 
-To find your TIDAL user id, leave `ALLOWED_TIDAL_USER_IDS` unset, connect once, then run `npx tidal-mcp status` locally, or set it to anything and read the id from the "isn't open to your TIDAL account" page.
+To find your TIDAL user id, set `ALLOWED_TIDAL_USER_IDS` to `0`, connect once, and read the id from the "isn't open to your TIDAL account" page. If you've used the local setup, `node dist/cli.js status` also prints it.
 
 **ChatGPT:** Plugins → **Add** → **Add custom MCP server**. Paste the MCP URL, keep authentication on **OAuth**, and create it. ChatGPT sends you through a consent page and then TIDAL's own sign-in.
 
