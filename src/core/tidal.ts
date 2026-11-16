@@ -206,13 +206,18 @@ export class Tidal {
   }
 
   /** Follows `links.next` cursors until `limit` primary resources are collected. */
-  private async collect(path: string, query: Record<string, string | undefined>, limit: number) {
+  private async collect(
+    path: string,
+    query: Record<string, string | undefined>,
+    limit: number,
+    failFast?: boolean,
+  ) {
     const data: Resource[] = [];
     const included: Resource[] = [];
     let next: string | undefined = path;
     let q: typeof query | undefined = query;
     while (next && data.length < limit) {
-      const doc = await this.request("GET", next.startsWith("/v2/") ? next.slice(3) : next, { query: q });
+      const doc = await this.request("GET", next.startsWith("/v2/") ? next.slice(3) : next, { query: q, failFast });
       if (!doc) break;
       data.push(...(Array.isArray(doc.data) ? doc.data : [doc.data]));
       included.push(...(doc.included ?? []));
@@ -235,8 +240,8 @@ export class Tidal {
     return this.countryCode;
   }
 
-  /** Full track details (with artist and album names) for ids, preserving order. */
-  async getTracks(trackIds: string[]): Promise<Track[]> {
+  /** Full track details (with artist and album names) for ids, preserving order. `failFast` as for searchTracks. */
+  async getTracks(trackIds: string[], opts: { failFast?: boolean } = {}): Promise<Track[]> {
     if (trackIds.length === 0) return [];
     const countryCode = await this.country();
     const byId = new Map<string, Track>();
@@ -245,6 +250,7 @@ export class Tidal {
         "/tracks",
         { "filter[id]": batch.join(","), include: "artists,albums.coverArt", countryCode },
         batch.length,
+        opts.failFast,
       );
       const inc = index(included);
       for (const r of data) byId.set(r.id, toTrack(r, inc));
@@ -275,7 +281,7 @@ export class Tidal {
     );
     const hits = ids(result?.relationships?.tracks).slice(0, limit);
     const missing = hits.filter((id) => !included.has(`tracks:${id}`));
-    const fetched = new Map((await this.getTracks(missing)).map((t) => [t.id, t]));
+    const fetched = new Map((await this.getTracks(missing, opts)).map((t) => [t.id, t]));
     return hits
       .map((id) => {
         const r = included.get(`tracks:${id}`);

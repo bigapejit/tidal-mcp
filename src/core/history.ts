@@ -12,6 +12,9 @@
  * or daily write budget) and the next run carries on. A play is keyed by (time, track), so pages
  * that overlap never count a play twice.
  *
+ * Top tracks count a song once under all its artist credits, since scrobbles credit one song in
+ * several ways ("Khruangbin & Leon Bridges", "Khruangbin, Leon Bridges", "Khruangbin").
+ *
  * TIDAL matches are looked up when a tool is about to show a track or artist, then cached.
  */
 import type { LastFm, Scrobble } from "./lastfm.js";
@@ -65,6 +68,8 @@ const SCHEMA = [
     fwd_cursor INTEGER,
     back_cursor INTEGER NOT NULL,
     back_done INTEGER NOT NULL DEFAULT 0,
+    fwd_page INTEGER NOT NULL DEFAULT 1,
+    back_page INTEGER NOT NULL DEFAULT 1,
     back_total INTEGER,
     back_fetched INTEGER NOT NULL DEFAULT 0,
     page_ok INTEGER NOT NULL DEFAULT 0,
@@ -72,6 +77,12 @@ const SCHEMA = [
     day TEXT,
     day_writes INTEGER NOT NULL DEFAULT 0)`,
 ];
+
+/** lastfm_sync columns added after its first release, for databases created before them. */
+const ADDED_COLUMNS = [
+  ["fwd_page", "INTEGER NOT NULL DEFAULT 1"],
+  ["back_page", "INTEGER NOT NULL DEFAULT 1"],
+] as const;
 
 /** Import progress, one row. Times are unix seconds except synced_at (epoch ms). */
 interface SyncRow {
@@ -81,6 +92,9 @@ interface SyncRow {
   /** An unfinished walk for new scrobbles, from fwd_cursor down to head minus the overlap. */
   fwd_hi: number | null;
   fwd_cursor: number | null;
+  /** Each walk's page within its window ending at the cursor. See advance. */
+  fwd_page: number;
+  back_page: number;
   back_cursor: number;
   back_done: number;
   /** Scrobbles the backfill set out to import, and how many it has fetched. */
@@ -99,6 +113,8 @@ export interface Coverage {
   since?: number;
   /** The import has reached the first scrobble. */
   complete: boolean;
+  /** No walk for new scrobbles is half done: everything up to the last sync is imported. */
+  current: boolean;
   /** Share of the initial import done, 0 to 1. */
   progress?: number;
   /** Why this call's sync failed, if it did; the data is then from syncedAt. */
@@ -201,11 +217,21 @@ function trackKey(artist: string, title: string): number {
   return 4294967296 * (h2 & 0x1fffff) + (h1 >>> 0);
 }
 
-/** The next cursor for a walk: the oldest scrobble on this page, re-read next time in case it shares its second. */
-function nextCursor(page: Scrobble[], cursor: number): number {
+/** Where a walk reads next: page `page` of its window, which ends just after second `cursor`. */
+interface Position {
+  cursor: number;
+  page: number;
+}
+
+/**
+ * A walk's position after reading a page at `at`, when there are more pages: the oldest second on
+ * the page, read again from its first page in case the second continues past this one. A page
+ * that is all one second (over 200 scrobbles in a second, as bulk imports produce) has no older
+ * second to move to, so the walk reads the window's next page instead, and skips none of it.
+ */
+function advance(page: Scrobble[], at: Position): Position {
   const oldest = Math.min(...page.map((s) => s.uts));
-  // A full page inside one second would never move the cursor; skip past it.
-  return oldest < cursor ? oldest : cursor - 1;
+  return oldest < at.cursor ? { cursor: oldest, page: 1 } : { cursor: at.cursor, page: at.page + 1 };
 }
 
 // ---------------------------------------------------------------- Matching to TIDAL
@@ -228,6 +254,16 @@ function loose(s: string): string {
 
 /** How Last.fm (and TIDAL's scrobbler) join several artists into one name. */
 const ARTIST_SEPARATORS = /( & |, and |, | feat\.? | ft\.? | featuring | x | vs\.? | with )/i;
+
+/**
+ * SQL for the song that track `t` is: its first artist and its title, lowercased. So "Khruangbin &
+ * Leon Bridges - Mariella", "Khruangbin, Leon Bridges - Mariella" and "Khruangbin - Mariella" are
+ * one song, while remixes and live versions, whose titles differ, stay apart. It cuts only at " & "
+ * and ", ", which nearly every collaboration credit uses; " x " and " with " are more often part
+ * of a band's name.
+ */
+const SONG_SQL = `lower(substr(t.artist, 1, min(instr(t.artist || ' & ', ' & '), instr(t.artist || ', ', ', ')) - 1))
+                  || char(31) || lower(t.title)`;
 
 const NON_ASCII = /[^\x00-\x7f]/;
 
@@ -387,11 +423,27 @@ export class History {
   private ready(): Promise<unknown> {
     let ready = schemaReady.get(this.sql);
     if (!ready) {
-      ready = this.sql.batch(SCHEMA.map((sql) => ({ sql })));
+      ready = this.sql.batch(SCHEMA.map((sql) => ({ sql }))).then(() => this.migrate());
       ready.catch(() => schemaReady.delete(this.sql));
       schemaReady.set(this.sql, ready);
     }
     return ready;
+  }
+
+  /** Adds the columns that databases created by older versions lack. */
+  private async migrate(): Promise<void> {
+    const missing = async () => {
+      const have = await this.sql.all<{ name: string }>("SELECT name FROM pragma_table_info('lastfm_sync')");
+      return ADDED_COLUMNS.filter(([column]) => !have.some((c) => c.name === column));
+    };
+    const todo = await missing();
+    if (!todo.length) return;
+    try {
+      await this.sql.batch(todo.map(([column, type]) => ({ sql: `ALTER TABLE lastfm_sync ADD COLUMN ${column} ${type}` })));
+    } catch (err) {
+      // Another process may have added them first.
+      if ((await missing()).length) throw err;
+    }
   }
 
   /** The import state, after checking it is the configured Last.fm user's. */
@@ -429,33 +481,52 @@ export class History {
     let s: SyncRow = existing ?? (await this.row())!;
     // New scrobbles first, so recent history stays current while the backfill runs. They aren't
     // budgeted (a day's worth is a few hundred rows) but are counted.
-    if (s.fwd_hi === null) [s.fwd_hi, s.fwd_cursor] = [now, now];
+    if (s.fwd_hi === null) [s.fwd_hi, s.fwd_cursor, s.fwd_page] = [now, now, 1];
     for (let left = pages.forward; left > 0 && s.fwd_hi !== null; left--) {
-      const page = await this.lastfm.recent({ from: Math.max(0, s.head - OVERLAP_SECONDS), to: s.fwd_cursor! + 1 });
-      if (page.totalPages <= 1) [s.head, s.fwd_hi, s.fwd_cursor] = [Math.max(s.head, s.fwd_hi), null, null];
-      else s.fwd_cursor = nextCursor(page.scrobbles, s.fwd_cursor!);
+      const at = { cursor: s.fwd_cursor!, page: s.fwd_page };
+      const page = await this.lastfm.recent({ from: Math.max(0, s.head - OVERLAP_SECONDS), to: at.cursor + 1, page: at.page });
+      if (page.totalPages <= at.page) {
+        [s.head, s.fwd_hi, s.fwd_cursor, s.fwd_page] = [Math.max(s.head, s.fwd_hi), null, null, 1];
+      } else {
+        ({ cursor: s.fwd_cursor, page: s.fwd_page } = advance(page.scrobbles, at));
+      }
       await this.save(page.scrobbles, {
-        set: "head = MAX(head, ?), fwd_hi = ?, fwd_cursor = ?, synced_at = ?",
-        params: [s.head, s.fwd_hi, s.fwd_cursor, Date.now()],
+        set: "head = MAX(head, ?), fwd_hi = ?, fwd_cursor = ?, fwd_page = ?, synced_at = ?",
+        params: [s.head, s.fwd_hi, s.fwd_cursor, s.fwd_page, Date.now()],
       });
     }
 
     for (let left = pages.backfill; left > 0 && !s.back_done; left--) {
       const reservation = await this.reserve();
       if (reservation === false) break; // today's write budget is spent
-      const page = await this.lastfm.recent({ to: s.back_cursor + 1 });
+      const at = { cursor: s.back_cursor, page: s.back_page };
+      const page = await this.lastfm.recent({ to: at.cursor + 1, page: at.page });
       // The walk's next position, adopted only once the page is committed.
       const next: SyncRow = { ...s, back_total: s.back_total ?? page.total, back_fetched: s.back_fetched + page.scrobbles.length };
-      if (page.totalPages <= 1) {
+      if (page.totalPages <= at.page) {
         next.back_done = 1;
         if (page.scrobbles.length) next.back_cursor = Math.min(s.back_cursor, ...page.scrobbles.map((x) => x.uts));
       } else {
-        next.back_cursor = nextCursor(page.scrobbles, s.back_cursor);
+        ({ cursor: next.back_cursor, page: next.back_page } = advance(page.scrobbles, at));
       }
+      // A concurrent sync may have walked further. The cursor only moves back, and the page follows
+      // whichever cursor wins (SET reads the row as it was), so a stale page never pairs with a
+      // newer cursor and skips scrobbles.
       const position = {
-        set: `back_cursor = MIN(back_cursor, ?), back_done = MAX(back_done, ?), back_total = ?, back_fetched = ?,
+        set: `back_page = CASE WHEN ? < back_cursor THEN ? WHEN ? = back_cursor THEN MAX(back_page, ?) ELSE back_page END,
+              back_cursor = MIN(back_cursor, ?), back_done = MAX(back_done, ?), back_total = ?, back_fetched = ?,
               synced_at = ?`,
-        params: [next.back_cursor, next.back_done, next.back_total, next.back_fetched, Date.now()],
+        params: [
+          next.back_cursor,
+          next.back_page,
+          next.back_cursor,
+          next.back_page,
+          next.back_cursor,
+          next.back_done,
+          next.back_total,
+          next.back_fetched,
+          Date.now(),
+        ],
       };
       let committed = await this.save(page.scrobbles, position, reservation);
       if (!committed && reservation) {
@@ -590,30 +661,31 @@ export class History {
   }
 
   /**
-   * Most-played tracks in the range, with totals for the whole range. Ranked by Last.fm track
-   * (artist and title), never by TIDAL match: matches fill in between calls, and grouping by them
-   * would reorder pages mid-pagination.
+   * Most-played songs in the range, with totals for the whole range. A song (see SONG_SQL) shows as
+   * its most-played Last.fm track, with the plays of all its tracks. Ranked by Last.fm names, never
+   * by TIDAL match: matches fill in between calls, and grouping by them would reorder pages
+   * mid-pagination.
    */
   async topTracks(range: Range, limit: number, offset: number, artist?: string) {
-    const counts = `SELECT track, COUNT(*) AS plays, MAX(uts) AS last FROM lastfm_plays
-                    WHERE uts >= ? AND uts < ? GROUP BY track`;
-    const columns = "t.id, t.artist, t.title, t.album, t.tidal, c.plays, c.last";
     const rows = await this.sql.all<TrackRow & { plays: number; last: number; total: number; track_count: number }>(
-      artist
-        ? // Filtering by artist needs every counted track's name.
-          `SELECT ${columns}, SUM(c.plays) OVER () AS total, COUNT(*) OVER () AS track_count
-           FROM (${counts}) c JOIN lastfm_tracks t ON t.id = c.track
-           WHERE t.artist LIKE ? ESCAPE '!'
-           ORDER BY c.plays DESC, c.last DESC, c.track LIMIT ? OFFSET ?`
-        : // Otherwise only the page's tracks are looked up, which keeps D1 rows read down.
-          `SELECT ${columns}, c.total, c.track_count
-           FROM (SELECT *, SUM(plays) OVER () AS total, COUNT(*) OVER () AS track_count FROM (${counts})
-                 ORDER BY plays DESC, last DESC, track LIMIT ? OFFSET ?) c
-           JOIN lastfm_tracks t ON t.id = c.track
-           ORDER BY c.plays DESC, c.last DESC, c.track`,
-      artist
-        ? [range.from, range.to, `%${artist.replace(/[!%_]/g, "!$&")}%`, limit + 1, offset]
-        : [range.from, range.to, limit + 1, offset],
+      // One GROUP BY, since sorting text keys is most of the cost (two window passes took twice as
+      // long). With exactly one max() in it, SQLite takes the bare column `track` from the row with
+      // the max: the song's most-played track, the most recent one on a tie. `last` is that track's.
+      `WITH counts AS (
+         SELECT track, COUNT(*) AS plays, MAX(uts) AS last FROM lastfm_plays WHERE uts >= ? AND uts < ? GROUP BY track),
+       songs AS (
+         SELECT ${SONG_SQL} AS song, c.track, MAX(c.plays * ${FOREVER} + c.last) AS top, SUM(c.plays) AS plays
+         FROM counts c JOIN lastfm_tracks t ON t.id = c.track
+         ${artist ? "WHERE instr(lower(t.artist), lower(?)) > 0" : ""}
+         GROUP BY 1),
+       page AS (
+         SELECT song, track, plays, top % ${FOREVER} AS last, SUM(plays) OVER () AS total, COUNT(*) OVER () AS track_count
+         FROM songs ORDER BY plays DESC, last DESC, song LIMIT ? OFFSET ?)
+       SELECT t.id, t.artist, t.title, t.album, t.tidal, p.plays, p.last, p.total, p.track_count
+       FROM page p JOIN lastfm_tracks t ON t.id = p.track
+       ORDER BY p.plays DESC, p.last DESC, p.song`,
+      // instr rather than LIKE, whose patterns D1 caps at 50 bytes. lower() folds ASCII only, as LIKE does.
+      artist ? [range.from, range.to, artist, limit + 1, offset] : [range.from, range.to, limit + 1, offset],
     );
     return {
       tracks: rows
@@ -839,11 +911,12 @@ export class History {
 }
 
 function coverage(s: SyncRow | undefined): Coverage {
-  if (!s) return { complete: false };
+  if (!s) return { complete: false, current: false };
   return {
     syncedAt: s.synced_at ?? undefined,
     since: s.back_cursor,
     complete: !!s.back_done,
+    current: s.fwd_hi === null,
     progress: s.back_done ? 1 : s.back_total ? Math.min(0.99, s.back_fetched / s.back_total) : 0,
   };
 }

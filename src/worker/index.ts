@@ -45,6 +45,8 @@ interface Props {
   refreshToken?: string;
   /** Epoch ms when the TIDAL access token expires. */
   expiresAt: number;
+  /** The consent page listed listening history. Grants made before it did lack this. */
+  historyConsent?: boolean;
 }
 
 const MCP_SCOPE = "playlists";
@@ -101,6 +103,10 @@ const historyOwner = (env: Env) =>
     .map((s) => s.trim())
     .find(Boolean);
 
+/** Whether this server gives anyone the history tools, and so asks for consent to them. */
+const historyOffered = (env: Env) =>
+  !!(env.LASTFM_API_KEY?.trim() && env.LASTFM_USER?.trim() && env.HISTORY_DB && historyOwner(env));
+
 // ---------------------------------------------------------------- MCP endpoint
 
 const mcpHandler = {
@@ -119,7 +125,8 @@ const mcpHandler = {
       { jsonSchemaValidator: new CfWorkerJsonSchemaValidator() },
       {
         feedback: feedbackConfig(env),
-        history: props.tidalUserId === historyOwner(env) ? history(env, ctx) : undefined,
+        // Only for the owner, on a grant whose consent page listed listening history.
+        history: props.historyConsent && props.tidalUserId === historyOwner(env) ? history(env, ctx) : undefined,
       },
     );
     // Stateless: every request is self-contained, so no Durable Objects are needed.
@@ -161,7 +168,7 @@ function page(title: string, body: string, status = 200, headers = new Headers()
   return new Response(html, { status, headers });
 }
 
-function consentPage(d: ConsentDescription, handle: string, headers: Headers): Response {
+function consentPage(d: ConsentDescription, handle: string, headers: Headers, withHistory: boolean): Response {
   const name = escape(d.clientName);
   const origin = d.clientDomain
     ? `Published by <strong>${escape(d.clientDomain)}</strong>.`
@@ -172,7 +179,9 @@ function consentPage(d: ConsentDescription, handle: string, headers: Headers): R
 <p>${origin} Access goes to <strong>${escape(d.redirectHost)}</strong>.</p>
 ${d.redirectIsLoopback ? `<p class="warn"><strong>This sends access to an app on your computer.</strong> Continue only if you just started connecting from it.</p>` : ""}
 <p>It will be able to:</p>
-<ul><li>Search the TIDAL catalog</li><li>See your playlists</li><li>Create, edit and delete your playlists</li></ul>
+<ul><li>Search the TIDAL catalog</li><li>See your playlists</li><li>Create, edit and delete your playlists</li>${
+      withHistory ? "<li>See your listening history from Last.fm (the server owner's account only)</li>" : ""
+    }</ul>
 <p>Next you'll sign in to TIDAL.</p>
 <form method="post">
   <input type="hidden" name="handle" value="${escape(handle)}">
@@ -203,7 +212,7 @@ const signIn = {
         const authRequest = await oauth.parseAuthRequest(request);
         const details = await oauth.describeConsent(authRequest);
         const consent = await oauth.beginConsent(authRequest);
-        return consentPage(details, consent.handle, consent.headers);
+        return consentPage(details, consent.handle, consent.headers, historyOffered(env));
       }
 
       if (url.pathname === "/authorize" && request.method === "POST") {
@@ -255,6 +264,8 @@ const signIn = {
           accessToken: token.access_token,
           refreshToken: token.refresh_token,
           expiresAt: Date.now() + token.expires_in * 1000,
+          // The consent page just shown listed history exactly when it is offered.
+          historyConsent: historyOffered(env),
         };
         const { redirectTo } = await oauth.completeAuthorization({
           request: original,

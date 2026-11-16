@@ -45,8 +45,11 @@ export class LastFm {
     readonly user: string,
   ) {}
 
-  /** One page of scrobbles in the window from `from` (inclusive) to `to` (exclusive), newest first. */
-  async recent(window: { from?: number; to?: number }): Promise<ScrobblePage> {
+  /**
+   * One page of scrobbles in the window from `from` (inclusive) to `to` (exclusive), newest first.
+   * `page` counts from 1.
+   */
+  async recent(window: { from?: number; to?: number; page?: number }): Promise<ScrobblePage> {
     const params = new URLSearchParams({
       method: "user.getrecenttracks",
       user: this.user,
@@ -56,6 +59,7 @@ export class LastFm {
     });
     if (window.from) params.set("from", String(window.from));
     if (window.to) params.set("to", String(window.to));
+    if (window.page && window.page > 1) params.set("page", String(window.page));
     type Body = {
       error?: number;
       message?: string;
