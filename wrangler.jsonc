@@ -8,8 +8,13 @@
   "workers_dev": true,
   "observability": { "enabled": true },
   // Holds OAuth grants. Wrangler creates the namespace on first deploy.
-  "kv_namespaces": [{ "binding": "OAUTH_KV" }]
+  "kv_namespaces": [{ "binding": "OAUTH_KV" }],
+  // Listening history imported from Last.fm. Wrangler creates the database on first deploy.
+  "d1_databases": [{ "binding": "HISTORY_DB", "database_name": "tidal-mcp-history" }],
+  // Every 5 minutes: import new scrobbles and continue the history backfill (src/core/history.ts).
+  "triggers": { "crons": ["*/5 * * * *"] }
   // Configuration is set as secrets, so it survives redeploys and stays out of the repo:
   //   npx wrangler secret put TIDAL_CLIENT_ID          your TIDAL app's client id
   //   npx wrangler secret put ALLOWED_TIDAL_USER_IDS   optional; your TIDAL user id, to lock the server to you
+  //   npx wrangler secret put LASTFM_API_KEY           optional, with LASTFM_USER: listening-history tools
 }

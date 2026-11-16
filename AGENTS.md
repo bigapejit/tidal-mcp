@@ -6,6 +6,7 @@ MCP server for TIDAL playlists. One codebase, two runtimes: `src/core` (runtime-
 
 - `npm run check` must pass: both typechecks plus a parse check of the view's script.
 - Live-test tool changes against the real TIDAL API: `npm run build && node scripts/call-tool.mjs <tool> '<json>' [--json]`. It prints timings, which matter here (users notice slow tool chains). The local session in `~/.tidal-mcp` is the owner's real account: read freely, and only create, edit or delete playlists you made for the test, deleting them afterwards.
+- The history tools (`src/core/history.ts`) appear locally only with `LASTFM_API_KEY` and `LASTFM_USER` in the environment (values in `.dev.vars`), and read `~/.tidal-mcp/history.sqlite`. Run `node dist/cli.js sync-history` first if that file is missing or stale.
 
 ## Rules no config will tell you
 

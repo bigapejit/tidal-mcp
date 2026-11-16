@@ -1,6 +1,6 @@
 {
   "name": "tidal-mcp",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "description": "MCP server for creating and managing TIDAL playlists through the official TIDAL API",
   "scripts": {
     "build": "tsc",

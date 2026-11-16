@@ -18,6 +18,8 @@ import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/
 import { CfWorkerJsonSchemaValidator } from "@modelcontextprotocol/sdk/validation/cfworker";
 import { AUTHORIZE_URL, TIDAL_SCOPES, Tidal, TidalError, pkceChallenge, tidalToken } from "../core/tidal.js";
 import { feedbackConfig } from "../core/feedback.js";
+import { History, type Sql } from "../core/history.js";
+import { LastFm } from "../core/lastfm.js";
 import { createServer } from "../core/tools.js";
 
 interface Env {
@@ -29,6 +31,10 @@ interface Env {
   /** Optional: enables send_feedback, filing issues on FEEDBACK_REPO ("owner/name"). */
   GITHUB_TOKEN?: string;
   FEEDBACK_REPO?: string;
+  /** Optional: enable the listening-history tools for the first account in ALLOWED_TIDAL_USER_IDS. */
+  LASTFM_API_KEY?: string;
+  LASTFM_USER?: string;
+  HISTORY_DB?: D1Database;
 }
 
 /** What each MCP grant carries (encrypted at rest by the OAuth library). */
@@ -47,6 +53,51 @@ const client = (env: Env) => ({ clientId: env.TIDAL_CLIENT_ID, clientSecret: env
 
 const secondsLeft = (props: Props) => Math.max(60, Math.floor((props.expiresAt - Date.now()) / 1000) - 60);
 
+// ---------------------------------------------------------------- Listening history
+
+/**
+ * Rows the history backfill may write per UTC day. D1's free plan allows 100k across the account,
+ * so this leaves room for new scrobbles, TIDAL matches and other databases.
+ */
+const HISTORY_DAILY_WRITES = 60_000;
+/** Last.fm pages per cron run: one for new scrobbles, two for the backfill. Keeps CPU near the free plan's 10 ms. */
+const HISTORY_PAGES_PER_RUN = 3;
+
+const d1Sql = new WeakMap<D1Database, Sql>();
+
+function history(env: Env, ctx?: ExecutionContext): History | undefined {
+  const apiKey = env.LASTFM_API_KEY?.trim();
+  const user = env.LASTFM_USER?.trim();
+  const db = env.HISTORY_DB;
+  if (!apiKey || !user || !db) return undefined;
+  let sql = d1Sql.get(db);
+  if (!sql) {
+    sql = {
+      async all<T>(query: string, params: unknown[] = []) {
+        return (await db.prepare(query).bind(...params).all<T>()).results;
+      },
+      async batch(statements) {
+        const results = await db.batch(statements.map((s) => db.prepare(s.sql).bind(...(s.params ?? []))));
+        return results.reduce((n, r) => n + (r.meta.rows_written ?? r.meta.changes ?? 0), 0);
+      },
+    };
+    d1Sql.set(db, sql);
+  }
+  return new History(sql, new LastFm(apiKey, user), {
+    dailyWrites: HISTORY_DAILY_WRITES,
+    defer: ctx && ((work) => ctx.waitUntil(work)),
+  });
+}
+
+/**
+ * The scrobbles are one person's, so only the first account in ALLOWED_TIDAL_USER_IDS sees them.
+ * Without an allow-list, nobody does.
+ */
+const historyOwner = (env: Env) =>
+  env.ALLOWED_TIDAL_USER_IDS?.split(",")
+    .map((s) => s.trim())
+    .find(Boolean);
+
 // ---------------------------------------------------------------- MCP endpoint
 
 const mcpHandler = {
@@ -63,7 +114,10 @@ const mcpHandler = {
     const server = createServer(
       tidal,
       { jsonSchemaValidator: new CfWorkerJsonSchemaValidator() },
-      { feedback: feedbackConfig(env) },
+      {
+        feedback: feedbackConfig(env),
+        history: props.tidalUserId === historyOwner(env) ? history(env, ctx) : undefined,
+      },
     );
     // Stateless: every request is self-contained, so no Durable Objects are needed.
     const transport = new WebStandardStreamableHTTPServerTransport({
@@ -288,5 +342,16 @@ export default {
     let provider = providers.get(origin);
     if (!provider) providers.set(origin, (provider = new OAuthProvider<Env>(providerOptions(origin))));
     return provider.fetch(request, env, ctx);
+  },
+
+  /** Cron: imports new scrobbles and continues the history backfill. */
+  async scheduled(_controller: ScheduledController, env: Env): Promise<void> {
+    const h = history(env);
+    if (!h) return;
+    const c = await h.sync(HISTORY_PAGES_PER_RUN);
+    if (!c.complete) {
+      const since = c.since ? new Date(c.since * 1000).toISOString().slice(0, 10) : "?";
+      console.log(`History import ${Math.round((c.progress ?? 0) * 100)}% done, back to ${since}`);
+    }
   },
 } satisfies ExportedHandler<Env>;
