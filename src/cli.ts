@@ -43,8 +43,13 @@ async function syncHistory() {
   for (;;) {
     const c = await history.sync({ forward: 25, backfill: 25 });
     const since = c.since ? new Date(c.since * 1000).toISOString().slice(0, 10) : "now";
-    console.log(c.complete ? `Done: history imported back to ${since}.` : `Imported back to ${since} (${Math.round((c.progress ?? 0) * 100)}%)...`);
-    if (c.complete) return;
+    // Both walks must finish: the backfill (complete) and the one for new scrobbles (current).
+    if (c.complete && c.current) return console.log(`Done: history imported back to ${since}.`);
+    console.log(
+      c.complete
+        ? `History imported back to ${since}; importing new scrobbles...`
+        : `Imported back to ${since} (${Math.round((c.progress ?? 0) * 100)}%)...`,
+    );
   }
 }
 

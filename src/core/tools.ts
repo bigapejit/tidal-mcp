@@ -13,7 +13,7 @@ import {
 import type { Playlist, Tidal, Track } from "./tidal.js";
 import { WIDGET_HTML } from "./widget.js";
 
-export const VERSION = "0.5.0";
+export const VERSION = "0.6.0";
 
 /**
  * MCP Apps UI (https://modelcontextprotocol.io/extensions/apps). The URI carries the version,

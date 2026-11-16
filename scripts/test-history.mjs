@@ -189,4 +189,102 @@ await check("a claim that lands after midnight counts against the new day, never
   assert.equal(r.plays, 200);
 });
 
+// --- Seconds with more than a page of scrobbles. This fake serves a fixed list the way Last.fm
+// does: a window, newest first, 200 a page.
+const listLastFm = (list) => ({ user: "u", async recent({ from = 0, to = Infinity, page = 1 }) {
+  const w = list.filter((s) => s.uts >= from && s.uts < to).sort((a, b) => b.uts - a.uts);
+  return { scrobbles: w.slice((page - 1) * 200, page * 200), total: w.length, totalPages: Math.ceil(w.length / 200) };
+} });
+const burst = (uts, n, tag) => Array.from({ length: n }, (_, i) => ({ uts, artist: "Bulk", title: `${tag} ${i}` }));
+const spread = (from, n) => Array.from({ length: n }, (_, i) => ({ uts: from + i, artist: "Solo", title: `S${from + i}` }));
+const playCount = async (sql) => (await sql.all("SELECT COUNT(*) AS n FROM lastfm_plays"))[0].n;
+
+await check("the backfill reads every scrobble of a second with more than a page of them", async () => {
+  const now = Math.floor(Date.now() / 1000);
+  const list = [...spread(now - 5000, 300), ...burst(now - 3000, 450, "old"), ...spread(now - 2000, 100)];
+  const sql = memSql();
+  const h = new History(sql, listLastFm(list), { dailyWrites: 1_000_000 });
+  let c;
+  for (let i = 0; i < 20 && !c?.complete; i++) c = await h.sync({ forward: 1, backfill: 1 });
+  assert.equal(c.complete, true);
+  assert.equal(await playCount(sql), 850);
+});
+
+await check("a walk for new scrobbles reads every scrobble of a crowded second, and says when it's current", async () => {
+  const now = Math.floor(Date.now() / 1000);
+  const list = spread(now - 5000, 10);
+  const sql = memSql();
+  const h = new History(sql, listLastFm(list));
+  assert.equal((await h.sync({ forward: 1, backfill: 5 })).current, true);
+  list.push(...burst(now - 60, 450, "new"));
+  const c = await h.sync({ forward: 1, backfill: 0 });
+  assert.equal(c.current, false, "one page of three read, so not current");
+  let d = c;
+  for (let i = 0; i < 10 && !d.current; i++) d = await h.sync({ forward: 1, backfill: 0 });
+  assert.equal(d.current, true);
+  assert.equal(await playCount(sql), 460);
+});
+
+await check("a database from before page columns gets them, and the import goes on from its cursor", async () => {
+  const sql = memSql();
+  sql.db.exec(`CREATE TABLE lastfm_sync (id INTEGER PRIMARY KEY CHECK (id = 1), lastfm_user TEXT NOT NULL,
+    head INTEGER NOT NULL, fwd_hi INTEGER, fwd_cursor INTEGER, back_cursor INTEGER NOT NULL,
+    back_done INTEGER NOT NULL DEFAULT 0, back_total INTEGER, back_fetched INTEGER NOT NULL DEFAULT 0,
+    page_ok INTEGER NOT NULL DEFAULT 0, synced_at INTEGER, day TEXT, day_writes INTEGER NOT NULL DEFAULT 0)`);
+  const now = Math.floor(Date.now() / 1000);
+  sql.db.prepare("INSERT INTO lastfm_sync (id, lastfm_user, head, back_cursor) VALUES (1, 'u', ?, ?)").run(now, now - 100);
+  const h = new History(sql, listLastFm(spread(now - 300, 300)));
+  const c = await h.sync({ forward: 0, backfill: 5 });
+  const [row] = await sql.all("SELECT fwd_page, back_page FROM lastfm_sync");
+  assert.deepEqual([row.fwd_page, row.back_page], [1, 1]);
+  assert.equal(c.complete, true);
+  assert.equal(await playCount(sql), 201, "plays from the stored cursor back");
+});
+
+// --- top_tracks.
+async function tracksDb(rows) {
+  const sql = memSql();
+  const h = new History(sql, { user: "u" });
+  await h.ready();
+  let id = 1, uts = 1000;
+  for (const [artist, title, plays] of rows) {
+    const t = id++;
+    sql.db.prepare("INSERT INTO lastfm_tracks (id, artist, title) VALUES (?, ?, ?)").run(t, artist, title);
+    for (let i = 0; i < plays; i++) sql.db.prepare("INSERT INTO lastfm_plays (uts, track) VALUES (?, ?)").run(uts++, t);
+  }
+  return h;
+}
+const names = (r) => r.tracks.map((t) => `${t.artist} - ${t.title}:${t.plays}`);
+
+await check("top tracks count a song once under all its artist credits, but keep other versions apart", async () => {
+  const h = await tracksDb([
+    ["Khruangbin", "Mariella", 3],
+    ["Khruangbin & Leon Bridges", "Mariella", 2],
+    ["KHRUANGBIN, Leon Bridges", "mariella", 1],
+    ["Khruangbin", "Mariella (Live)", 4],
+    ["Leon Bridges & Khruangbin", "Mariella", 1],
+    ["Other", "Song", 5],
+  ]);
+  const r = await h.topTracks(all, 10, 0);
+  assert.deepEqual(names(r), ["Khruangbin - Mariella:6", "Other - Song:5", "Khruangbin - Mariella (Live):4", "Leon Bridges & Khruangbin - Mariella:1"]);
+  assert.deepEqual([r.plays, r.distinct, r.more], [16, 4, false]);
+  const paged = [...names(await h.topTracks(all, 2, 0)), ...names(await h.topTracks(all, 2, 2))];
+  assert.deepEqual(paged, names(r));
+});
+
+await check("top tracks' artist filter is a literal, case-insensitive substring of any length", async () => {
+  const h = await tracksDb([
+    ["Khruangbin", "Mariella", 3],
+    ["Khruangbin & Leon Bridges", "Mariella", 2],
+    ["DJ_100%", "Track", 1],
+    ["A Band Whose Name Runs Well Past Fifty Bytes Of Pattern", "Long", 1],
+  ]);
+  assert.deepEqual(names(await h.topTracks(all, 10, 0, "leon BRIDGES")), ["Khruangbin & Leon Bridges - Mariella:2"]);
+  assert.deepEqual(names(await h.topTracks(all, 10, 0, "_100%")), ["DJ_100% - Track:1"]);
+  assert.deepEqual(names(await h.topTracks(all, 10, 0, "%")), ["DJ_100% - Track:1"]);
+  assert.deepEqual(names(await h.topTracks(all, 10, 0, "A Band Whose Name Runs Well Past Fifty Bytes Of Pattern")), [
+    "A Band Whose Name Runs Well Past Fifty Bytes Of Pattern - Long:1",
+  ]);
+});
+
 console.log(`${ok} passed`);
