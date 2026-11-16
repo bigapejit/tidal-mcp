@@ -40,6 +40,14 @@ export interface Track {
   url: string;
 }
 
+export interface Artist {
+  id: string;
+  name: string;
+  /** Profile picture, about 320px square. */
+  picture?: string;
+  url: string;
+}
+
 export interface Playlist {
   id: string;
   name: string;
@@ -150,7 +158,12 @@ export class Tidal {
   private async request(
     method: string,
     path: string,
-    opts: { query?: Record<string, string | undefined>; body?: unknown } = {},
+    opts: {
+      query?: Record<string, string | undefined>;
+      body?: unknown;
+      /** Throw on 429 instead of waiting it out, for optional lookups that can be retried later. */
+      failFast?: boolean;
+    } = {},
   ): Promise<Document | undefined> {
     const url = new URL(path.startsWith("http") ? path : API_BASE + path);
     // Encode with %20, not URLSearchParams' "+", so a literal "+" in a search survives.
@@ -175,7 +188,7 @@ export class Tidal {
         headers,
         body: opts.body === undefined ? undefined : JSON.stringify(opts.body),
       });
-      if (res.status === 429 && attempt < 3) {
+      if (res.status === 429 && attempt < 3 && !opts.failFast) {
         const wait = Number(res.headers.get("Retry-After")) || 2 ** attempt;
         await new Promise((r) => setTimeout(r, wait * 1000));
         continue;
@@ -239,12 +252,50 @@ export class Tidal {
     return trackIds.map((id) => byId.get(id)).filter((t): t is Track => !!t);
   }
 
-  async searchTracks(query: string, limit: number): Promise<Track[]> {
+  /** One search request; `include` pulls in the related resources the results need. */
+  private async search(query: string, include: string, failFast?: boolean) {
     const doc = await this.request("GET", "/searchResults", {
-      query: { "filter[query]": query, countryCode: await this.country(), explicitFilter: "INCLUDE", include: "tracks" },
+      query: { "filter[query]": query, countryCode: await this.country(), explicitFilter: "INCLUDE", include },
+      failFast,
     });
     const result = (Array.isArray(doc?.data) ? doc.data[0] : doc?.data) as Resource | undefined;
-    return this.getTracks(ids(result?.relationships?.tracks).slice(0, limit));
+    return { result, included: index(doc?.included ?? []) };
+  }
+
+  /**
+   * TIDAL allows about ten searches in a burst, then answers 429 for a few seconds. With
+   * `failFast`, a 429 throws a TidalError right away instead of waiting.
+   */
+  async searchTracks(query: string, limit: number, opts: { failFast?: boolean } = {}): Promise<Track[]> {
+    // Nested includes return artists and covers with the hits, saving a second request per search.
+    const { result, included } = await this.search(
+      query,
+      "tracks,tracks.artists,tracks.albums.coverArt",
+      opts.failFast,
+    );
+    const hits = ids(result?.relationships?.tracks).slice(0, limit);
+    const missing = hits.filter((id) => !included.has(`tracks:${id}`));
+    const fetched = new Map((await this.getTracks(missing)).map((t) => [t.id, t]));
+    return hits
+      .map((id) => {
+        const r = included.get(`tracks:${id}`);
+        return r ? toTrack(r, included) : fetched.get(id);
+      })
+      .filter((t): t is Track => !!t);
+  }
+
+  async searchArtists(query: string, limit: number, opts: { failFast?: boolean } = {}): Promise<Artist[]> {
+    const { result, included } = await this.search(query, "artists,artists.profileArt", opts.failFast);
+    return ids(result?.relationships?.artists)
+      .slice(0, limit)
+      .map((id) => included.get(`artists:${id}`))
+      .filter((r): r is Resource => !!r?.attributes?.name)
+      .map((r) => ({
+        id: r.id,
+        name: r.attributes!.name,
+        picture: coverUrl(ids(r.relationships?.profileArt), included),
+        url: `https://tidal.com/artist/${r.id}`,
+      }));
   }
 
   async similarTracks(trackId: string, limit: number): Promise<Track[]> {

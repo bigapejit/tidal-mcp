@@ -2,10 +2,18 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { ServerOptions } from "@modelcontextprotocol/sdk/server/index.js";
 import { z } from "zod";
 import { describeStatus, feedbackStatus, fileIssue, type FeedbackConfig } from "./feedback.js";
+import {
+  PERIODS,
+  parseRange,
+  type Coverage,
+  type History,
+  type HistoryTrack,
+  type Range,
+} from "./history.js";
 import type { Playlist, Tidal, Track } from "./tidal.js";
 import { WIDGET_HTML } from "./widget.js";
 
-export const VERSION = "0.4.1";
+export const VERSION = "0.5.0";
 
 /**
  * MCP Apps UI (https://modelcontextprotocol.io/extensions/apps). The URI carries the version,
@@ -61,6 +69,42 @@ function safe<A>(fn: (args: A) => Promise<ToolResult>) {
 export interface ServerExtras {
   /** When set, adds `send_feedback`, which files issues on this repo. */
   feedback?: FeedbackConfig;
+  /** When set, adds the listening-history tools. It must be the signed-in user's own history. */
+  history?: History;
+}
+
+const plural = (n: number, word: string) => `${n.toLocaleString("en-US")} ${word}${n === 1 ? "" : "s"}`;
+const isoDay = (uts: number) => new Date(uts * 1000).toISOString().slice(0, 10);
+const isoMinute = (uts: number) => new Date(uts * 1000).toISOString().slice(0, 16).replace("T", " ");
+
+/** One scrobbled track, shown as its TIDAL match when there is one. */
+function historyLine(t: HistoryTrack): string {
+  const m = t.tidal;
+  const name = m ? `${m.artists.join(", ") || t.artist} - ${m.title}` : `${t.artist} - ${t.title}`;
+  const album = m ? m.album : t.album;
+  const status = m ? ` id:${m.id}` : m === null ? " (no TIDAL match)" : " (not matched to TIDAL yet)";
+  return `${name}${album ? ` [${album}]` : ""}${status}`;
+}
+
+/** The view shows the TIDAL track when matched, else what Last.fm recorded. */
+const viewTrack = (t: HistoryTrack) => ({
+  ...(t.tidal ?? { title: t.title, artists: [t.artist], album: t.album }),
+  plays: t.plays,
+  playedAt: t.playedAt ? new Date(t.playedAt * 1000).toISOString() : undefined,
+  match: t.tidal ? undefined : t.tidal === null ? "none" : "pending",
+});
+
+/** Where the numbers come from and how complete they are. */
+function coverageNote(c: Coverage, range: Range): string {
+  const ago = c.syncedAt === undefined ? undefined : Math.round((Date.now() - c.syncedAt) / 60_000);
+  let note = `Source: Last.fm scrobbles${ago === undefined ? "" : `, synced ${ago < 1 ? "just now" : `${ago} min ago`}`}.`;
+  if (c.error) note += ` Couldn't sync just now (${c.error}).`;
+  if (!c.complete && range.from < (c.since ?? Infinity)) {
+    note +=
+      ` The history import is ${Math.round((c.progress ?? 0) * 100)}% done: plays before ` +
+      `${c.since ? isoDay(c.since) : "today"} aren't counted yet, so treat totals as partial.`;
+  }
+  return note;
 }
 
 /** An MCP server exposing the playlist tools, bound to one signed-in TIDAL user. */
@@ -77,7 +121,11 @@ export function createServer(
         "Manage the user's TIDAL playlists. To build a playlist from song names, call find_tracks with " +
         "'Artist - Title' strings, check the matches, then create_playlist with the track ids. " +
         "Ask before deleting a playlist. Tools with a visual view already show covers and track lists " +
-        "to the user, so summarize briefly instead of repeating every track.",
+        "to the user, so summarize briefly instead of repeating every track." +
+        (extras.history
+          ? " top_tracks, top_artists and listening_history show what the user actually plays, with play " +
+            "counts: ground recommendations in them rather than only in saved playlists."
+          : ""),
     },
   );
 
@@ -307,6 +355,139 @@ export function createServer(
       return result("Playlist deleted.");
     }),
   );
+
+  const history = extras.history;
+  if (history) {
+    const range = {
+      period: z.enum(PERIODS).optional().describe("Rolling window. Ignored when from or to is set"),
+      from: z
+        .string()
+        .max(40)
+        .optional()
+        .describe("Start: 2024, 2024-06, 2024-06-01 or an ISO datetime (UTC unless it has an offset)"),
+      to: z.string().max(40).optional().describe("End, same formats. A year, month or day includes all of it"),
+    };
+    const pageArg = z.number().int().min(1).max(1000).default(1).describe("1 for the first page");
+    const footer = (pending: number, more: boolean, current: number) =>
+      (pending
+        ? `\n${plural(pending, "track")} not matched to TIDAL yet (TIDAL limits lookups). They're being matched ` +
+          "now; call again in a minute for their ids, or use find_tracks."
+        : "") +
+      (more ? `\nMore: page ${current + 1}.` : "");
+
+    server.registerTool(
+      "listening_history",
+      {
+        title: "Listening history",
+        description:
+          "Tracks the user actually played (their Last.fm scrobbles from TIDAL), newest first, with play " +
+          "times in UTC and TIDAL track ids. Use it for recently played, or for what they played in any period.",
+        inputSchema: { ...range, limit: z.number().int().min(1).max(200).default(25), page: pageArg },
+        annotations: { readOnlyHint: true, openWorldHint: true },
+        _meta: withView,
+      },
+      safe(async ({ period, from, to, limit, page }) => {
+        const r = parseRange({ period, from, to });
+        const coverage = await history.refresh();
+        const { tracks, more } = await history.plays(r, limit, (page - 1) * limit);
+        const pending = await history.matchTracks(tidal, tracks);
+        const title = !period && !from && !to ? "Recently played" : `Listening history, ${r.label}`;
+        const lines = tracks.map((t) => `${isoMinute(t.playedAt!)} ${historyLine(t)}`);
+        return result(
+          `${title}${page > 1 ? `, page ${page}` : ""}. ${coverageNote(coverage, r)}\n\n` +
+            (lines.length ? lines.join("\n") : "No plays in this period.") +
+            footer(pending, more, page),
+          { kind: "tracks", title, subtitle: plural(tracks.length, "play"), tracks: tracks.map(viewTrack) },
+        );
+      }),
+    );
+
+    server.registerTool(
+      "top_tracks",
+      {
+        title: "Top tracks",
+        description:
+          "The user's most-played tracks with play counts, from their Last.fm scrobbles: what they really " +
+          "replay, not just what they saved. High counts mark favorites; one or two plays mark things they " +
+          "only tried. All time unless a period or dates are given. Results carry TIDAL track ids for " +
+          "create_playlist; pass favorites to similar_tracks to find music next to them.",
+        inputSchema: {
+          ...range,
+          artist: z.string().min(1).max(200).optional().describe("Only tracks whose artist name contains this"),
+          limit: z.number().int().min(1).max(100).default(25),
+          page: pageArg,
+        },
+        annotations: { readOnlyHint: true, openWorldHint: true },
+        _meta: withView,
+      },
+      safe(async ({ period, from, to, artist, limit, page }) => {
+        const r = parseRange({ period, from, to });
+        const coverage = await history.refresh();
+        const offset = (page - 1) * limit;
+        const top = await history.topTracks(r, limit, offset, artist);
+        const pending = await history.matchTracks(tidal, top.tracks);
+        const tracks = top.tracks;
+        const title = `Top tracks${artist ? ` by ${artist}` : ""}, ${r.label}`;
+        const lines = tracks.map((t, i) => `${offset + i + 1}. ${plural(t.plays!, "play")}: ${historyLine(t)}`);
+        return result(
+          `${title}: ${plural(top.plays, "play")} of ${plural(top.distinct, "track")}. ${coverageNote(coverage, r)}\n\n` +
+            (lines.length ? lines.join("\n") : "No plays in this period.") +
+            footer(pending, top.more, page),
+          {
+            kind: "tracks",
+            title,
+            subtitle: `${plural(top.plays, "play")} · ${plural(top.distinct, "track")}`,
+            start: offset,
+            tracks: tracks.map(viewTrack),
+          },
+        );
+      }),
+    );
+
+    server.registerTool(
+      "top_artists",
+      {
+        title: "Top artists",
+        description:
+          "The user's most-played artists with play counts and how many of their tracks they've played, " +
+          "from Last.fm scrobbles. All time unless a period or dates are given. A collaboration counts " +
+          "toward each artist on it.",
+        inputSchema: { ...range, limit: z.number().int().min(1).max(100).default(25), page: pageArg },
+        annotations: { readOnlyHint: true, openWorldHint: true },
+        _meta: withView,
+      },
+      safe(async ({ period, from, to, limit, page }) => {
+        const r = parseRange({ period, from, to });
+        const coverage = await history.refresh();
+        const offset = (page - 1) * limit;
+        const top = await history.topArtists(r, limit, offset);
+        await history.matchArtists(tidal, top.artists);
+        const lines = top.artists.map(
+          (a, i) =>
+            `${offset + i + 1}. ${a.name}: ${plural(a.plays, "play")}, ${plural(a.tracks, "track")}, last ${isoDay(a.lastPlayed)}`,
+        );
+        return result(
+          `Top artists, ${r.label}: ${plural(top.plays, "play")} in all. ${coverageNote(coverage, r)}\n\n` +
+            (lines.length ? lines.join("\n") : "No plays in this period.") +
+            footer(0, top.more, page),
+          {
+            kind: "artists",
+            title: `Top artists, ${r.label}`,
+            subtitle: plural(top.plays, "play"),
+            start: offset,
+            artists: top.artists.map((a) => ({
+              name: a.name,
+              plays: a.plays,
+              tracks: a.tracks,
+              picture: a.tidal?.picture,
+              url: a.tidal?.url,
+              match: a.tidal ? undefined : a.tidal === null ? "none" : "pending",
+            })),
+          },
+        );
+      }),
+    );
+  }
 
   const feedback = extras.feedback;
   if (feedback) {

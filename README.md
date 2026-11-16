@@ -17,6 +17,7 @@ In clients that support [MCP Apps](https://modelcontextprotocol.io/extensions/ap
 
 - **Playlists:** cover, track count, total length, an "Open in TIDAL" button, and the track list.
 - **Track lists** (search, matches, similar tracks): album art, artists, album, explicit badges, and durations, 12 at a time.
+- **Listening history:** the same rows with play counts or play times, and ranked artists with their pictures.
 - **Your library:** a grid of playlist covers, two rows at a time.
 
 Clicking a track or playlist opens it in TIDAL. The card follows the host's light or dark theme. Clients without MCP Apps support get the same results as compact text.
@@ -36,6 +37,23 @@ Issues are public, so the tool tells the model to leave out personal details. Wi
 
 This repo goes one step further: a GitHub webhook hands each `feedback` issue to a coding agent, which opens a PR. CodeRabbit and CI review the PR, then the agent merges and deploys it.
 
+## Listening history (Last.fm)
+
+TIDAL's API has no listening history, but TIDAL can scrobble to [Last.fm](https://www.last.fm). With a Last.fm account connected to TIDAL, the server adds `listening_history`, `top_tracks` and `top_artists`. They answer "what did I play last week", "my most-played Khruangbin songs" and "who did I listen to most in 2024" with real play counts, and match tracks and artists to TIDAL so the results can go straight into a playlist.
+
+Scrobbles are copied into a database (Cloudflare D1 on the Worker, SQLite locally), so a ranking over years of history is one query. TIDAL matches are cached after the first lookup.
+
+**Remote:** set two Worker secrets ([get an API key](https://www.last.fm/api/account/create)):
+
+```sh
+npx wrangler secret put LASTFM_API_KEY
+npx wrangler secret put LASTFM_USER         # your Last.fm username
+```
+
+The D1 database and a 5-minute cron are in `wrangler.jsonc`; Wrangler creates the database on deploy. Each cron run imports new scrobbles and continues the initial import, which stays under the free plan's daily D1 write limit, so a large history (100k scrobbles) takes about two days to finish. The tools work meanwhile and say how far back the data goes. Only the first account in `ALLOWED_TIDAL_USER_IDS` gets these tools, since the history is yours; without that secret, nobody does.
+
+**Local:** set `LASTFM_API_KEY` and `LASTFM_USER` in the environment the MCP client starts the server with, and import once with `node dist/cli.js sync-history` (a few minutes; rerun it any time). The server then keeps the data current on its own. Needs Node 22.13 or newer.
+
 ## Tools
 
 | Tool | What it does |
@@ -50,6 +68,9 @@ This repo goes one step further: a GitHub webhook hands each `feedback` issue to
 | `remove_tracks` | Remove tracks from a playlist |
 | `update_playlist` | Rename, re-describe, or change visibility |
 | `delete_playlist` | Delete a playlist (annotated as destructive, so clients ask first) |
+| `listening_history` | What you played, newest first, for any period (only with Last.fm configured) |
+| `top_tracks` | Your most-played tracks with play counts, optionally for one artist or period |
+| `top_artists` | Your most-played artists with play counts |
 | `send_feedback` | File feedback as a GitHub issue and show a live tracker until it ships (only when configured) |
 | `feedback_status` | Where a filed issue is: queued, building, in review, shipping, live, or blocked |
 
@@ -118,7 +139,8 @@ The JSON form is for Claude Desktop and other clients that use a config file.
 node dist/cli.js            Run the MCP server over stdio
 node dist/cli.js login      Sign in to TIDAL
 node dist/cli.js status     Check whether you're signed in
-node dist/cli.js logout     Delete the saved session and settings
+node dist/cli.js sync-history   Import your Last.fm history (see Listening history)
+node dist/cli.js logout     Delete the saved session, settings and history
 ```
 
 `TIDAL_CLIENT_ID`, `TIDAL_CLIENT_SECRET`, and `TIDAL_MCP_HOME` (the session folder) can also be set as environment variables.

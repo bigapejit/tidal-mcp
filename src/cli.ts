@@ -3,8 +3,11 @@ import { parseArgs } from "node:util";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { Tidal } from "./core/tidal.js";
 import { feedbackConfig } from "./core/feedback.js";
+import { History } from "./core/history.js";
+import { LastFm } from "./core/lastfm.js";
 import { createServer } from "./core/tools.js";
 import { getTokens, login, openInBrowser } from "./node/auth.js";
+import { openHistoryDb } from "./node/history-db.js";
 import {
   DEFAULT_PORT,
   clearAll,
@@ -15,9 +18,34 @@ import {
   saveSettings,
 } from "./node/config.js";
 
+/** Listening history, when LASTFM_API_KEY and LASTFM_USER are set. */
+async function historyFromEnv(): Promise<History | undefined> {
+  const apiKey = process.env.LASTFM_API_KEY?.trim();
+  const user = process.env.LASTFM_USER?.trim();
+  if (!apiKey || !user) return undefined;
+  // The server process outlives each tool call, so deferred work just runs on.
+  return new History(await openHistoryDb(), new LastFm(apiKey, user), { defer: () => {} });
+}
+
 async function runServer() {
   const tidal = new Tidal(async () => (await getTokens()).accessToken, (await loadTokens())?.countryCode);
-  await createServer(tidal, {}, { feedback: feedbackConfig(process.env) }).connect(new StdioServerTransport());
+  const extras = { feedback: feedbackConfig(process.env), history: await historyFromEnv() };
+  await createServer(tidal, {}, extras).connect(new StdioServerTransport());
+}
+
+/** Imports the whole Last.fm history. Safe to stop and rerun: it picks up where it left off. */
+async function syncHistory() {
+  const history = await historyFromEnv();
+  if (!history) {
+    console.error("Set LASTFM_API_KEY and LASTFM_USER first (a Last.fm API key and your Last.fm username).");
+    process.exit(1);
+  }
+  for (;;) {
+    const c = await history.sync({ forward: 25, backfill: 25 });
+    const since = c.since ? new Date(c.since * 1000).toISOString().slice(0, 10) : "now";
+    console.log(c.complete ? `Done: history imported back to ${since}.` : `Imported back to ${since} (${Math.round((c.progress ?? 0) * 100)}%)...`);
+    if (c.complete) return;
+  }
 }
 
 const HELP = `tidal-mcp: an MCP server for managing TIDAL playlists
@@ -30,7 +58,9 @@ Usage:
       --port <n>                 Callback port (default ${DEFAULT_PORT})
       --no-browser               Print the sign-in URL instead of opening it
   tidal-mcp status               Show whether you're signed in
-  tidal-mcp logout               Delete the saved session and settings
+  tidal-mcp sync-history         Import your Last.fm scrobbles for the history tools
+                                 (needs LASTFM_API_KEY and LASTFM_USER)
+  tidal-mcp logout               Delete the saved session, settings and history
 `;
 
 async function main() {
@@ -85,6 +115,9 @@ async function main() {
       );
       return;
     }
+
+    case "sync-history":
+      return syncHistory();
 
     case "logout":
       await clearAll();

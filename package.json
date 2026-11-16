@@ -1,11 +1,11 @@
 {
   "name": "tidal-mcp",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "description": "MCP server for creating and managing TIDAL playlists through the official TIDAL API",
   "scripts": {
     "build": "tsc",
     "prepare": "tsc",
-    "check": "tsc && tsc -p src/worker/tsconfig.json && node scripts/check-widget.mjs",
+    "check": "tsc && tsc -p src/worker/tsconfig.json && node scripts/check-widget.mjs && node scripts/test-history.mjs",
     "deploy": "npm run check && wrangler deploy",
     "start": "node dist/cli.js",
     "login": "node dist/cli.js login"

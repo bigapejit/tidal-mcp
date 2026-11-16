@@ -1,8 +1,8 @@
 /**
  * Inline UI for MCP Apps hosts (ChatGPT, Claude, VS Code, ...).
  *
- * One self-contained page renders every tool result shape: a track list, a playlist with its
- * tracks, or a grid of playlists. It speaks the MCP Apps postMessage protocol directly
+ * One self-contained page renders every tool result shape: a track list (optionally with play
+ * counts or play times), a playlist with its tracks, a grid of playlists, or ranked artists. It speaks the MCP Apps postMessage protocol directly
  * (ui/initialize, tool-result notifications, size-changed, open-link), so it needs no bundle.
  * Text is inserted with textContent only; tool data never becomes markup.
  *
@@ -79,7 +79,12 @@ export const WIDGET_HTML = String.raw`<!doctype html>
   .title > span { overflow: hidden; text-overflow: ellipsis; }
   .sub { color: var(--muted); font-size: 12.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .e { flex: none; font-size: 9px; font-weight: 700; line-height: 1; padding: 2px 3px; border-radius: 3px; background: var(--chip); color: var(--muted); }
-  .dur { color: var(--muted); font-size: 12.5px; font-variant-numeric: tabular-nums; }
+  .dur { color: var(--muted); font-size: 12.5px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .row.static { cursor: default; }
+  .row.static:hover { background: transparent; }
+  .row.static .title, .row.static .art { opacity: .6; }
+  .note { color: var(--faint); }
+  .art.round { border-radius: 50%; }
 
   .art { display: block; object-fit: cover; background: var(--chip); }
   .ph { display: grid; place-items: center; background: linear-gradient(135deg, var(--chip), var(--bg-hover)); color: var(--faint); }
@@ -200,12 +205,39 @@ export const WIDGET_HTML = String.raw`<!doctype html>
   function sumSeconds(tracks) {
     return tracks.reduce(function (s, t) { return s + (t.durationSeconds || 0); }, 0);
   }
-  function plural(n, word) { return n + " " + word + (n === 1 ? "" : "s"); }
+  function plural(n, word) { return Number(n).toLocaleString() + " " + word + (n === 1 ? "" : "s"); }
+
+  // When a play happened, in the viewer's own time zone.
+  function when(iso) {
+    var d = new Date(iso), now = new Date();
+    if (isNaN(d.getTime())) return "";
+    var mins = Math.round((now.getTime() - d.getTime()) / 60000);
+    if (mins < 60) return Math.max(1, mins) + " min ago";
+    if (d.toDateString() === now.toDateString()) return d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+    var yesterday = new Date(now.getTime()); yesterday.setDate(now.getDate() - 1);
+    if (d.toDateString() === yesterday.toDateString()) return "Yesterday";
+    var opts = { month: "short", day: "numeric" };
+    if (d.getFullYear() !== now.getFullYear()) opts.year = "numeric";
+    return d.toLocaleDateString([], opts);
+  }
+
+  // A clickable row when the item is on TIDAL; a plain one when it isn't.
+  function rowShell(url) {
+    var r;
+    if (url) {
+      r = el("button", "row"); r.type = "button"; r.title = "Open in TIDAL";
+      r.onclick = function () { openLink(url); };
+    } else {
+      r = el("div", "row static");
+    }
+    return r;
+  }
+  function matchNote(match) {
+    return match === "none" ? "No TIDAL match" : match === "pending" ? "Not matched to TIDAL yet" : "";
+  }
 
   function trackRow(t, i) {
-    var b = el("button", "row");
-    b.type = "button";
-    b.title = "Open in TIDAL";
+    var b = rowShell(t.url);
     b.appendChild(el("span", "num", i + 1));
     b.appendChild(art(t.cover, ""));
     var text = el("span", "text");
@@ -213,21 +245,39 @@ export const WIDGET_HTML = String.raw`<!doctype html>
     title.appendChild(el("span", "", t.title));
     if (t.explicit) { var e = el("span", "e", "E"); e.title = "Explicit"; title.appendChild(e); }
     text.appendChild(title);
-    var sub = (t.artists && t.artists.length ? t.artists.join(", ") : "Unknown artist") + (t.album ? " — " + t.album : "");
-    text.appendChild(el("span", "sub", sub));
+    var sub = el("span", "sub", (t.artists && t.artists.length ? t.artists.join(", ") : "Unknown artist") + (t.album ? " — " + t.album : ""));
+    if (matchNote(t.match)) sub.appendChild(el("span", "note", " · " + matchNote(t.match)));
+    text.appendChild(sub);
     b.appendChild(text);
-    b.appendChild(el("span", "dur", t.duration || ""));
-    b.onclick = function () { openLink(t.url); };
+    var right = t.plays !== undefined && t.plays !== null ? plural(t.plays, "play") : t.playedAt ? when(t.playedAt) : (t.duration || "");
+    b.appendChild(el("span", "dur", right));
     var li = el("li"); li.appendChild(b);
     return li;
   }
 
-  function trackList(tracks) {
+  function artistRow(a, i) {
+    var b = rowShell(a.url);
+    b.appendChild(el("span", "num", i + 1));
+    b.appendChild(art(a.picture, "round"));
+    var text = el("span", "text");
+    var title = el("span", "title"); title.appendChild(el("span", "", a.name)); text.appendChild(title);
+    var sub = el("span", "sub", plural(a.tracks || 0, "track"));
+    if (matchNote(a.match)) sub.appendChild(el("span", "note", " · " + matchNote(a.match)));
+    text.appendChild(sub);
+    b.appendChild(text);
+    b.appendChild(el("span", "dur", plural(a.plays || 0, "play")));
+    var li = el("li"); li.appendChild(b);
+    return li;
+  }
+
+  function trackList(tracks, start, rowFn) {
     var wrap = el("div");
     var ul = el("ul", "rows");
     var shown = 0;
+    start = start || 0;
+    rowFn = rowFn || trackRow;
     function more() {
-      tracks.slice(shown, shown + PAGE).forEach(function (t, i) { ul.appendChild(trackRow(t, shown + i)); });
+      tracks.slice(shown, shown + PAGE).forEach(function (t, i) { ul.appendChild(rowFn(t, start + shown + i)); });
       shown = Math.min(tracks.length, shown + PAGE);
       btn.hidden = shown >= tracks.length;
       btn.textContent = "Show " + Math.min(PAGE, tracks.length - shown) + " more";
@@ -267,9 +317,9 @@ export const WIDGET_HTML = String.raw`<!doctype html>
     var head = el("div", "head");
     head.appendChild(el("h1", "", data.title || "Tracks"));
     var secs = sumSeconds(tracks);
-    head.appendChild(el("span", "", plural(tracks.length, "track") + (secs ? " · " + totalTime(secs) : "")));
+    head.appendChild(el("span", "", data.subtitle || (plural(tracks.length, "track") + (secs ? " · " + totalTime(secs) : ""))));
     app.appendChild(head);
-    if (tracks.length) app.appendChild(trackList(tracks));
+    if (tracks.length) app.appendChild(trackList(tracks, data.start));
     else app.appendChild(el("div", "empty", "No tracks found."));
     if (data.missing && data.missing.length) {
       var box = el("div", "missing");
@@ -277,6 +327,16 @@ export const WIDGET_HTML = String.raw`<!doctype html>
       box.appendChild(document.createTextNode(data.missing.join(", ")));
       app.appendChild(box);
     }
+  }
+
+  function renderArtists(data) {
+    var artists = data.artists || [];
+    var head = el("div", "head");
+    head.appendChild(el("h1", "", data.title || "Artists"));
+    head.appendChild(el("span", "", data.subtitle || plural(artists.length, "artist")));
+    app.appendChild(head);
+    if (artists.length) app.appendChild(trackList(artists, data.start, artistRow));
+    else app.appendChild(el("div", "empty", "No artists found."));
   }
 
   function renderPlaylists(data) {
@@ -388,6 +448,7 @@ export const WIDGET_HTML = String.raw`<!doctype html>
     app.textContent = "";
     if (data.kind === "playlist") renderPlaylist(data);
     else if (data.kind === "playlists") renderPlaylists(data);
+    else if (data.kind === "artists") renderArtists(data);
     else if (data.kind === "feedback") renderFeedback(data.status || {});
     else renderTracks(data);
   }
