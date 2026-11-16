@@ -47,9 +47,6 @@ const FOREVER = 10_000_000_000;
 /** Most rows one Last.fm page can write: a track and a play per scrobble, plus three state updates. */
 const PAGE_WRITES = 200 * 2 + 3;
 
-/** The UTC day D1's daily limits count against. */
-const utcDay = () => new Date().toISOString().slice(0, 10);
-
 const SCHEMA = [
   // id: a hash of the lowercased artist and title, so a play can point at its track without a lookup.
   // tidal: NULL until looked up, '' when TIDAL has no match, otherwise the matched Track as JSON.
@@ -444,14 +441,9 @@ export class History {
     }
 
     for (let left = pages.backfill; left > 0 && !s.back_done; left--) {
-      let reservation = await this.reserve();
+      const reservation = await this.reserve();
       if (reservation === false) break; // today's write budget is spent
       const page = await this.lastfm.recent({ to: s.back_cursor + 1 });
-      // Midnight UTC passed while fetching: the page must fit the new day's budget, or wait for it.
-      if (reservation && reservation.day !== utcDay()) {
-        reservation = await this.reserve();
-        if (reservation === false) break;
-      }
       // The walk's next position, adopted only once the page is committed.
       const next: SyncRow = { ...s, back_total: s.back_total ?? page.total, back_fetched: s.back_fetched + page.scrobbles.length };
       if (page.totalPages <= 1) {
@@ -460,16 +452,18 @@ export class History {
       } else {
         next.back_cursor = nextCursor(page.scrobbles, s.back_cursor);
       }
-      const committed = await this.save(
-        page.scrobbles,
-        {
-          set: `back_cursor = MIN(back_cursor, ?), back_done = MAX(back_done, ?), back_total = ?, back_fetched = ?,
-                synced_at = ?`,
-          params: [next.back_cursor, next.back_done, next.back_total, next.back_fetched, Date.now()],
-        },
-        reservation,
-      );
-      if (!committed) break; // midnight passed before the commit; the page is retried on the new day's budget
+      const position = {
+        set: `back_cursor = MIN(back_cursor, ?), back_done = MAX(back_done, ?), back_total = ?, back_fetched = ?,
+              synced_at = ?`,
+        params: [next.back_cursor, next.back_done, next.back_total, next.back_fetched, Date.now()],
+      };
+      let committed = await this.save(page.scrobbles, position, reservation);
+      if (!committed && reservation) {
+        // The claim's day ended before the commit: claim against the new day and try once more.
+        const renewed = await this.reserve();
+        committed = renewed !== false && (await this.save(page.scrobbles, position, renewed));
+      }
+      if (!committed) break; // the new day's budget is spent; the page is fetched again later
       s = next;
     }
 
@@ -483,19 +477,20 @@ export class History {
    * Resolves to the claim (to settle when the page is saved), undefined without a budget, or false
    * when the budget is spent. The claim covers the page's most writes plus the claim's own row. A
    * claim that is never settled (a crash mid-page) only overcounts.
+   *
+   * The database's clock picks the day, and 'now' is fixed within one statement, so a claim that
+   * lands just after midnight counts against the new day instead of overwriting it with yesterday's.
    */
   private async reserve(): Promise<{ day: string; rows: number } | undefined | false> {
     if (this.dailyWrites === Infinity) return undefined;
-    const day = utcDay();
     const rows = PAGE_WRITES + 1;
-    const today = "(CASE WHEN day = ? THEN day_writes ELSE 0 END)";
-    const claimed = await this.sql.batch([
-      {
-        sql: `UPDATE lastfm_sync SET day_writes = ${today} + ?, day = ? WHERE id = 1 AND ${today} + ? <= ?`,
-        params: [day, rows, day, day, rows, this.dailyWrites],
-      },
-    ]);
-    return claimed[0] > 0 && { day, rows };
+    const today = "(CASE WHEN day = date('now') THEN day_writes ELSE 0 END)";
+    const [claim] = await this.sql.all<{ day: string }>(
+      `UPDATE lastfm_sync SET day_writes = ${today} + ?, day = date('now')
+       WHERE id = 1 AND ${today} + ? <= ? RETURNING day`,
+      [rows, rows, this.dailyWrites],
+    );
+    return claim ? { day: claim.day, rows } : false;
   }
 
   /**
@@ -521,8 +516,9 @@ export class History {
       if (!tracks.has(id)) tracks.set(id, { id, artist: s.artist, title: s.title, album: s.album ?? null });
       plays.push({ uts: s.uts, id });
     }
-    const day = reservation?.day ?? utcDay();
+    // The day the writes count against: the claim's, or the database's today for unclaimed pages.
     const onDay = reservation?.day ?? null;
+    const day = "COALESCE(?, date('now'))";
     const admitted = "(SELECT page_ok FROM lastfm_sync WHERE id = 1) = 1";
     // json_each keeps a whole page to one statement each, well under D1's 100 bound parameters.
     const written = await this.sql.batch([
@@ -541,9 +537,9 @@ export class History {
       },
       {
         // changes(): the tracks just written. +2 for this UPDATE and the page_ok one.
-        sql: `UPDATE lastfm_sync SET day_writes = (CASE WHEN day = ? THEN day_writes ELSE 0 END) + changes() + 2,
-                day = ? WHERE id = 1 AND page_ok = 1`,
-        params: [day, day],
+        sql: `UPDATE lastfm_sync SET day_writes = (CASE WHEN day = ${day} THEN day_writes ELSE 0 END) + changes() + 2,
+                day = ${day} WHERE id = 1 AND page_ok = 1`,
+        params: [onDay, onDay],
       },
       {
         sql: `INSERT OR IGNORE INTO lastfm_plays (uts, track)

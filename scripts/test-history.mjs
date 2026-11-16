@@ -109,82 +109,84 @@ await check("concurrent syncs never exceed the budget", async () => {
   assert.ok(n.rows <= 5_000, `${n.rows} rows written over budget`);
 });
 
-await check("a page fetched across midnight claims against the new day, or waits", async () => {
-  const RealDate = Date;
-  let now = RealDate.parse("2026-11-16T23:59:59.900Z");
-  globalThis.Date = class extends RealDate { constructor(...a) { super(...(a.length ? a : [now])); } static now() { return now; } };
-  try {
-    const sql = memSql();
-    // The fetch crosses midnight.
-    const h = new History(sql, fakeLastFm(async () => { now += 200; }), { dailyWrites: 2_000 });
-    await h.sync({ forward: 1, backfill: 0 }); // now 2026-11-17 00:00:00.100
-    now = RealDate.parse("2026-11-17T23:59:59.900Z");
-    sql.db.prepare("UPDATE lastfm_sync SET day = '2026-11-17', day_writes = 0").run();
-    // Pretend the new day's budget is already spent by another sync once midnight passes.
-    const lf2 = fakeLastFm(async () => { now += 200; sql.db.prepare("UPDATE lastfm_sync SET day = '2026-11-18', day_writes = 1999").run(); });
-    const h2 = new History(sql, lf2, { dailyWrites: 2_000 });
-    const before = (await state(sql)).back_fetched;
-    await h2.sync({ forward: 0, backfill: 1 });
-    const s = await state(sql);
-    assert.equal(s.back_fetched, before, "page committed without new-day budget");
-    assert.equal(s.day, "2026-11-18");
-    assert.ok(s.day_writes <= 2_000, `day_writes ${s.day_writes}`);
-  } finally { globalThis.Date = RealDate; }
-});
-await check("a page that would commit after midnight by the database's clock writes nothing, then is retried", async () => {
+// --- Midnight UTC. These control SQLite's clock (date() is overridden on the test connection)
+// and hook in before each statement of a batch, to land midnight at exact points.
+function clockedDb() {
   const sql = memSql();
-  // Pages follow the cursor, so a skipped page would show up as a gap.
-  const lf = { user: "u", async recent({ from, to }) {
-    if (from) return { scrobbles: [], total: 0, totalPages: 0 };
-    const scrobbles = Array.from({ length: 200 }, (_, i) => ({ uts: to - 1 - i, artist: `Artist ${to - 1 - i}`, title: "T" }));
-    return { scrobbles, total: 1e6, totalPages: 5000 };
-  } };
-  const h = new History(sql, lf, { dailyWrites: 100_000 });
-  await h.sync({ forward: 1, backfill: 0 });
-  const [{ back_cursor: start }] = await sql.all("SELECT back_cursor FROM lastfm_sync");
-  // The JS clock (which made the reservation) is on another day than SQLite's date('now').
-  const RealDate = Date;
-  const other = RealDate.parse("2030-01-01T12:00:00Z");
-  globalThis.Date = class extends RealDate { constructor(...a) { super(...(a.length ? a : [other])); } static now() { return other; } };
-  try {
-    await h.sync({ forward: 0, backfill: 2 });
-  } finally { globalThis.Date = RealDate; }
-  const [skipped] = await sql.all("SELECT back_cursor, back_fetched, (SELECT COUNT(*) FROM lastfm_plays) AS plays FROM lastfm_sync");
-  assert.deepEqual([skipped.back_cursor, skipped.back_fetched, skipped.plays], [start, 0, 0]);
-  await h.sync({ forward: 0, backfill: 1 });
-  const [after] = await sql.all("SELECT back_fetched, (SELECT COUNT(*) FROM lastfm_plays) AS plays, (SELECT MAX(uts) FROM lastfm_plays) AS newest FROM lastfm_sync");
-  assert.deepEqual([after.back_fetched, after.plays, after.newest], [200, 200, start]);
-});
-
-// Midnight between the statements of one commit: SQLite's date() is replaced so its first call
-// returns `first` and every later call returns another day.
-async function midBatchMidnight(first) {
-  const sql = memSql();
-  const lf = { user: "u", async recent({ from, to }) {
-    if (from) return { scrobbles: [], total: 0, totalPages: 0 };
-    const scrobbles = Array.from({ length: 200 }, (_, i) => ({ uts: to - 1 - i, artist: `Artist ${to - 1 - i}`, title: "T" }));
-    return { scrobbles, total: 1e6, totalPages: 5000 };
-  } };
-  const h = new History(sql, lf, { dailyWrites: 100_000 });
-  await h.sync({ forward: 1, backfill: 0 });
-  const [{ back_cursor: start }] = await sql.all("SELECT back_cursor FROM lastfm_sync");
-  let calls = 0;
-  sql.db.function("date", { varargs: true }, () => (calls++ === 0 ? first : "2099-01-01"));
-  await h.sync({ forward: 0, backfill: 1 });
-  const [r] = await sql.all(`SELECT back_cursor, back_fetched, (SELECT COUNT(*) FROM lastfm_plays) AS plays,
-                               (SELECT COUNT(*) FROM lastfm_tracks) AS tracks FROM lastfm_sync`);
-  return { start, ...r };
+  const clock = { today: "2099-01-01", before: () => {} };
+  sql.db.function("date", { varargs: true }, () => clock.today);
+  sql.batch = async (stmts) => {
+    sql.db.exec("BEGIN");
+    try {
+      const n = stmts.map((s, i) => { clock.before(i, s.sql); return Number(sql.db.prepare(s.sql).run(...(s.params ?? [])).changes); });
+      sql.db.exec("COMMIT");
+      return n;
+    } catch (e) { sql.db.exec("ROLLBACK"); throw e; }
+  };
+  return { sql, clock };
 }
+// Pages follow the cursor, so a skipped page shows up as a gap.
+const cursorLastFm = (onFetch) => ({ user: "u", async recent({ from, to }) {
+  await onFetch?.();
+  if (from) return { scrobbles: [], total: 0, totalPages: 0 };
+  const scrobbles = Array.from({ length: 200 }, (_, i) => ({ uts: to - 1 - i, artist: `Artist ${to - 1 - i}`, title: "T" }));
+  return { scrobbles, total: 1e6, totalPages: 5000 };
+} });
+const isCommit = (sql) => sql.includes("SET page_ok");
+const snapshot = async (sql) => (await sql.all(`SELECT day, day_writes, back_cursor, back_fetched,
+  (SELECT COUNT(*) FROM lastfm_plays) AS plays, (SELECT COUNT(*) FROM lastfm_tracks) AS tracks,
+  (SELECT MAX(uts) FROM lastfm_plays) AS newest FROM lastfm_sync`))[0];
+
+await check("midnight between a claim and its commit: the page re-claims on the new day and lands whole", async () => {
+  const { sql, clock } = clockedDb();
+  const h = new History(sql, cursorLastFm(), { dailyWrites: 100_000 });
+  await h.sync({ forward: 1, backfill: 0 });
+  const start = (await snapshot(sql)).back_cursor;
+  clock.before = (i, s) => { if (i === 0 && isCommit(s)) clock.today = "2099-01-02"; };
+  await h.sync({ forward: 0, backfill: 1 });
+  const r = await snapshot(sql);
+  assert.deepEqual([r.plays, r.tracks, r.back_fetched, r.newest, r.day], [200, 200, 200, start, "2099-01-02"]);
+});
 
 await check("midnight between a commit's statements: the page is stored whole", async () => {
-  const r = await midBatchMidnight(new Date().toISOString().slice(0, 10));
+  const { sql, clock } = clockedDb();
+  const h = new History(sql, cursorLastFm(), { dailyWrites: 100_000 });
+  await h.sync({ forward: 1, backfill: 0 });
+  let inCommit = false;
+  clock.before = (i, s) => { if (i === 0) inCommit = isCommit(s); if (inCommit && i === 1) clock.today = "2099-01-02"; };
+  await h.sync({ forward: 0, backfill: 1 });
+  const r = await snapshot(sql);
   assert.deepEqual([r.plays, r.tracks, r.back_fetched], [200, 200, 200]);
-  assert.ok(r.back_cursor < r.start, "cursor didn't move");
 });
 
-await check("past midnight at a commit's first statement: nothing is stored, not even tracks", async () => {
-  const r = await midBatchMidnight("2099-01-01");
-  assert.deepEqual([r.plays, r.tracks, r.back_fetched, r.back_cursor], [0, 0, 0, r.start]);
+await check("midnight with the new day's budget already spent: nothing is stored and the cursor stays", async () => {
+  const { sql, clock } = clockedDb();
+  const lf = cursorLastFm(() => {
+    if (clock.armed) { clock.today = "2099-01-02"; sql.db.prepare("UPDATE lastfm_sync SET day = '2099-01-02', day_writes = 1999").run(); }
+  });
+  const h = new History(sql, lf, { dailyWrites: 2_000 });
+  await h.sync({ forward: 1, backfill: 0 });
+  const before = await snapshot(sql);
+  clock.armed = true;
+  await h.sync({ forward: 0, backfill: 1 });
+  const r = await snapshot(sql);
+  assert.deepEqual([r.plays, r.tracks, r.back_fetched, r.back_cursor], [0, 0, before.back_fetched, before.back_cursor]);
+  assert.equal(r.day, "2099-01-02");
+  assert.ok(r.day_writes <= 2_000, `day_writes ${r.day_writes}`);
+});
+
+await check("a claim that lands after midnight counts against the new day, never overwriting it", async () => {
+  const { sql, clock } = clockedDb();
+  const h = new History(sql, cursorLastFm(), { dailyWrites: 100_000 });
+  await h.sync({ forward: 1, backfill: 0 });
+  // Another sync already moved the count to the new day; the database clock agrees.
+  sql.db.prepare("UPDATE lastfm_sync SET day = '2099-01-02', day_writes = 500").run();
+  clock.today = "2099-01-02";
+  await h.sync({ forward: 0, backfill: 1 });
+  const r = await snapshot(sql);
+  assert.equal(r.day, "2099-01-02");
+  assert.ok(r.day_writes >= 500 + 400, `new day's count was overwritten: ${r.day_writes}`);
+  assert.equal(r.plays, 200);
 });
 
 console.log(`${ok} passed`);
