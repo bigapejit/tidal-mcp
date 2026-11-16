@@ -525,27 +525,30 @@ export class History {
   }
 
   /**
-   * Most-played tracks in the range, with totals for the whole range. Tracks that matched the same
-   * TIDAL track count as one, before ranking, since the scrobbler sometimes names a song two ways
-   * ("Khruangbin" and "Khruangbin & Leon Bridges"); the most-played name represents it.
+   * Most-played tracks in the range, with totals for the whole range. Ranked by Last.fm track
+   * (artist and title), never by TIDAL match: matches fill in between calls, and grouping by them
+   * would reorder pages mid-pagination.
    */
   async topTracks(range: Range, limit: number, offset: number, artist?: string) {
-    const filter = artist ? `%${artist.replace(/[!%_]/g, "!$&")}%` : null;
+    const counts = `SELECT track, COUNT(*) AS plays, MAX(uts) AS last FROM lastfm_plays
+                    WHERE uts >= ? AND uts < ? GROUP BY track`;
+    const columns = "t.id, t.artist, t.title, t.album, t.tidal, c.plays, c.last";
     const rows = await this.sql.all<TrackRow & { plays: number; last: number; total: number; track_count: number }>(
-      `WITH c AS (SELECT track, COUNT(*) AS plays, MAX(uts) AS last FROM lastfm_plays
-                  WHERE uts >= ? AND uts < ? GROUP BY track),
-       j AS (SELECT t.id, t.artist, t.title, t.album, t.tidal,
-                    SUM(c.plays) OVER song AS plays, MAX(c.last) OVER song AS last,
-                    ROW_NUMBER() OVER (song ORDER BY c.plays DESC, c.last DESC) AS pick
-             FROM c JOIN lastfm_tracks t ON t.id = c.track
-             WHERE ? IS NULL OR t.artist LIKE ? ESCAPE '!'
-             WINDOW song AS (PARTITION BY CASE WHEN t.tidal IS NULL OR t.tidal = '' THEN 'lastfm:' || t.id
-                                               ELSE json_extract(t.tidal, '$.id') END))
-       SELECT id, artist, title, album, tidal, plays, last,
-              SUM(plays) OVER () AS total, COUNT(*) OVER () AS track_count
-       FROM j WHERE pick = 1
-       ORDER BY plays DESC, last DESC LIMIT ? OFFSET ?`,
-      [range.from, range.to, filter, filter, limit + 1, offset],
+      artist
+        ? // Filtering by artist needs every counted track's name.
+          `SELECT ${columns}, SUM(c.plays) OVER () AS total, COUNT(*) OVER () AS track_count
+           FROM (${counts}) c JOIN lastfm_tracks t ON t.id = c.track
+           WHERE t.artist LIKE ? ESCAPE '!'
+           ORDER BY c.plays DESC, c.last DESC, c.track LIMIT ? OFFSET ?`
+        : // Otherwise only the page's tracks are looked up, which keeps D1 rows read down.
+          `SELECT ${columns}, c.total, c.track_count
+           FROM (SELECT *, SUM(plays) OVER () AS total, COUNT(*) OVER () AS track_count FROM (${counts})
+                 ORDER BY plays DESC, last DESC, track LIMIT ? OFFSET ?) c
+           JOIN lastfm_tracks t ON t.id = c.track
+           ORDER BY c.plays DESC, c.last DESC, c.track`,
+      artist
+        ? [range.from, range.to, `%${artist.replace(/[!%_]/g, "!$&")}%`, limit + 1, offset]
+        : [range.from, range.to, limit + 1, offset],
     );
     return {
       tracks: rows
