@@ -20,7 +20,12 @@ Reproduce the complaint before changing anything: `npm run build && node scripts
 Push and open a PR with `gh pr create`. The body says what the user experienced, the root cause, what changed, before/after evidence (timings, tool output), and `Fixes #<n>`. Link the PR (`link_pull_request`), then `watch_pull_request` and end your turn. You'll be woken when CI and reviews arrive.
 
 ## 5. Review
-CodeRabbit reviews automatically within a few minutes; Codex may review too. Apply the triage rule in `AGENTS.md`, push fixes, and reply on each thread you resolved. The PR is ready when CI is green, CodeRabbit has posted a review of the latest push or reported nothing to review, and no critical or major finding is open. If CodeRabbit hasn't reviewed after 20 minutes, comment `@coderabbitai review` once; if there's still nothing after another 15, proceed without it and say so in the PR.
+CodeRabbit reviews automatically within a few minutes; Codex may review too. Review is two rounds, not a loop:
+
+1. **First review.** Apply the triage rule in `AGENTS.md` to everything it raises, push all fixes in as few commits as you can, and reply on each thread you resolved.
+2. **One re-check.** Comment `@coderabbitai review` once for the fix commits. Fix any new critical or major finding it raises; everything else goes to the follow-up issue.
+
+The PR is ready when CI is green, both rounds are done, and no critical or major finding is open. Don't request a third review: later rounds mostly surface fresh nitpicks on the fixes, and merging is cheaper than chasing them. If a round hasn't come back after 20 minutes, comment `@coderabbitai review` once; if there's still nothing after another 15, proceed without it and say so in the PR.
 
 ## 6. Ship
 1. `gh pr merge <pr> --squash --delete-branch`.
