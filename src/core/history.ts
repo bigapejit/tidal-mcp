@@ -44,6 +44,8 @@ const MATCH_LATER = 10;
 const MATCH_LATER_PACE_MS = 1200;
 /** An end time later than any scrobble. */
 const FOREVER = 10_000_000_000;
+/** Most rows one Last.fm page can write: a track and a play per scrobble, plus two state updates. */
+const PAGE_WRITES = 200 * 2 + 2;
 
 const SCHEMA = [
   // id: a hash of the lowercased artist and title, so a play can point at its track without a lookup.
@@ -405,7 +407,6 @@ export class History {
   async sync(pages: { forward: number; backfill: number }): Promise<Coverage> {
     await this.ready();
     const now = Math.floor(Date.now() / 1000);
-    const today = new Date().toISOString().slice(0, 10);
     let s = await this.row();
     if (!s) {
       // The backfill covers everything before this moment; syncs cover everything after.
@@ -417,33 +418,22 @@ export class History {
       ]);
       s = (await this.row())!;
     }
-    let written = 0;
-    /** Saves a page, then counts its writes toward today's budget right away, so a later failure can't lose them. */
-    const commit = async (scrobbles: Scrobble[], position: SqlStatement) => {
-      const n = await this.save(scrobbles, position);
-      written += n;
-      await this.sql.batch([
-        {
-          sql: "UPDATE lastfm_sync SET day_writes = CASE WHEN day = ? THEN day_writes + ? ELSE ? END, day = ? WHERE id = 1",
-          params: [today, n, n, today],
-        },
-      ]);
-    };
-
-    // New scrobbles first, so recent history stays current while the backfill runs.
+    // New scrobbles first, so recent history stays current while the backfill runs. They aren't
+    // budgeted (a day's worth is a few hundred rows) but are counted.
     if (s.fwd_hi === null) [s.fwd_hi, s.fwd_cursor] = [now, now];
     for (let left = pages.forward; left > 0 && s.fwd_hi !== null; left--) {
       const page = await this.lastfm.recent({ from: Math.max(0, s.head - OVERLAP_SECONDS), to: s.fwd_cursor! + 1 });
       if (page.totalPages <= 1) [s.head, s.fwd_hi, s.fwd_cursor] = [Math.max(s.head, s.fwd_hi), null, null];
       else s.fwd_cursor = nextCursor(page.scrobbles, s.fwd_cursor!);
-      await commit(page.scrobbles, {
-        sql: "UPDATE lastfm_sync SET head = MAX(head, ?), fwd_hi = ?, fwd_cursor = ?, synced_at = ? WHERE id = 1",
+      await this.save(page.scrobbles, {
+        set: "head = MAX(head, ?), fwd_hi = ?, fwd_cursor = ?, synced_at = ?",
         params: [s.head, s.fwd_hi, s.fwd_cursor, Date.now()],
       });
     }
 
-    const writesToday = () => (s.day === today ? s.day_writes : 0) + written;
-    for (let left = pages.backfill; left > 0 && !s.back_done && writesToday() < this.dailyWrites; left--) {
+    for (let left = pages.backfill; left > 0 && !s.back_done; left--) {
+      const reservation = await this.reserve();
+      if (reservation === false) break; // today's write budget is spent
       const page = await this.lastfm.recent({ to: s.back_cursor + 1 });
       s.back_total ??= page.total;
       s.back_fetched += page.scrobbles.length;
@@ -453,19 +443,50 @@ export class History {
       } else {
         s.back_cursor = nextCursor(page.scrobbles, s.back_cursor);
       }
-      await commit(page.scrobbles, {
-        sql: `UPDATE lastfm_sync SET back_cursor = MIN(back_cursor, ?), back_done = MAX(back_done, ?), back_total = ?,
-                back_fetched = ?, synced_at = ? WHERE id = 1`,
-        params: [s.back_cursor, s.back_done, s.back_total, s.back_fetched, Date.now()],
-      });
+      await this.save(
+        page.scrobbles,
+        {
+          set: `back_cursor = MIN(back_cursor, ?), back_done = MAX(back_done, ?), back_total = ?, back_fetched = ?,
+                synced_at = ?`,
+          params: [s.back_cursor, s.back_done, s.back_total, s.back_fetched, Date.now()],
+        },
+        reservation,
+      );
     }
 
     s.synced_at = Date.now();
     return coverage(s);
   }
 
-  /** Stores a page of scrobbles and the walk's new position together. Returns rows written. */
-  private async save(scrobbles: Scrobble[], position: SqlStatement): Promise<number> {
+  /**
+   * Claims a page's worth of today's write budget before a backfill page is fetched. The check and
+   * the claim are one conditional UPDATE, so concurrent syncs can't both spend the last of it.
+   * Resolves to the claim (to settle when the page is saved), undefined without a budget, or false
+   * when the budget is spent. A claim that is never settled (a crash mid-page) only overcounts.
+   */
+  private async reserve(): Promise<{ day: string; rows: number } | undefined | false> {
+    if (this.dailyWrites === Infinity) return undefined;
+    const day = new Date().toISOString().slice(0, 10);
+    const today = "(CASE WHEN day = ? THEN day_writes ELSE 0 END)";
+    const claimed = await this.sql.batch([
+      {
+        sql: `UPDATE lastfm_sync SET day_writes = ${today} + ?, day = ? WHERE id = 1 AND ${today} + ? <= ?`,
+        params: [day, PAGE_WRITES, day, day, PAGE_WRITES, this.dailyWrites],
+      },
+    ]);
+    return claimed > 0 && { day, rows: PAGE_WRITES };
+  }
+
+  /**
+   * Stores a page of scrobbles, the walk's new position, and the rows the page wrote, in one
+   * transaction: SQLite's changes() counts each insert as the next statement runs. A backfill page
+   * swaps its reservation for that count; the reservation's own UPDATE stays counted.
+   */
+  private async save(
+    scrobbles: Scrobble[],
+    position: { set: string; params: unknown[] },
+    reservation?: { day: string; rows: number },
+  ): Promise<void> {
     const tracks = new Map<number, { id: number; artist: string; title: string; album: string | null }>();
     const plays: { uts: number; id: number }[] = [];
     for (const s of scrobbles) {
@@ -473,8 +494,11 @@ export class History {
       if (!tracks.has(id)) tracks.set(id, { id, artist: s.artist, title: s.title, album: s.album ?? null });
       plays.push({ uts: s.uts, id });
     }
+    const day = new Date().toISOString().slice(0, 10);
+    // A claim from before midnight UTC belongs to yesterday's count, which this page doesn't touch.
+    const release = reservation?.day === day ? reservation.rows - 1 : 0;
     // json_each keeps a whole page to one statement each, well under D1's 100 bound parameters.
-    return this.sql.batch([
+    await this.sql.batch([
       {
         sql: `INSERT INTO lastfm_tracks (id, artist, title, album)
               SELECT json_extract(value, '$.id'), json_extract(value, '$.artist'), json_extract(value, '$.title'),
@@ -485,11 +509,21 @@ export class History {
         params: [JSON.stringify([...tracks.values()])],
       },
       {
+        // changes(): the tracks just written. +1 for this UPDATE.
+        sql: `UPDATE lastfm_sync SET day_writes = (CASE WHEN day = ? THEN day_writes ELSE 0 END) + changes() + 1,
+                day = ? WHERE id = 1`,
+        params: [day, day],
+      },
+      {
         sql: `INSERT OR IGNORE INTO lastfm_plays (uts, track)
               SELECT json_extract(value, '$.uts'), json_extract(value, '$.id') FROM json_each(?)`,
         params: [JSON.stringify(plays)],
       },
-      position,
+      {
+        // changes(): the plays just written. +1 for this UPDATE, minus the settled reservation.
+        sql: `UPDATE lastfm_sync SET day_writes = MAX(0, day_writes + changes() + 1 - ?), ${position.set} WHERE id = 1`,
+        params: [release, ...position.params],
+      },
     ]);
   }
 
