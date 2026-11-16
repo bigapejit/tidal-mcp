@@ -1,9 +1,16 @@
 // Boundary tests for the listening history: top_artists paging and the D1 write budget.
 // Runs against an in-memory node:sqlite database and a fake Last.fm, so it needs no network.
 //   npm run build && node scripts/test-history.mjs
-import { DatabaseSync } from "node:sqlite";
+// Skipped on Node versions without node:sqlite (before 22.13), which the rest of the server supports.
 import assert from "node:assert/strict";
 import { History, parseRange } from "../dist/core/history.js";
+
+const sqlite = await import("node:sqlite").catch(() => undefined);
+if (!sqlite) {
+  console.log(`history tests skipped: node:sqlite needs Node 22.13+ (this is ${process.version})`);
+  process.exit(0);
+}
+const { DatabaseSync } = sqlite;
 
 function memSql() {
   const db = new DatabaseSync(":memory:");
@@ -50,6 +57,16 @@ await check("pages don't overlap or skip when a later page falls back to the ful
   assert.deepEqual(paged, whole);
   assert.deepEqual(paged.slice(0, 3).sort(), ["A:101", "B:101", "X:99"]); assert.equal(paged[2], "X:99");
   assert.equal(new Set(paged).size, paged.length);
+});
+
+await check("spellings of one artist pass the cutoff together (Alpha 3 + ALPHA 2 beats X 5)", async () => {
+  const filler = Array.from({ length: 4000 }, (_, i) => [`Filler ${i}`, 1]);
+  const h = await artistsDb([["Alpha", 3], ["ALPHA", 2], ["Alpha & B", 1], ["X", 5], ...filler]);
+  const r = await h.topArtists(all, 1, 0);
+  assert.equal(`${r.artists[0].name}:${r.artists[0].plays}`, "Alpha:6");
+  const exact = await h.rankArtists(all, 1);
+  const top = exact.all.sort((a, b) => b.plays - a.plays)[0];
+  assert.equal(`${top.name}:${top.plays}`, "Alpha:6");
 });
 
 // --- Budget: a fake Last.fm with endless full pages of new tracks.

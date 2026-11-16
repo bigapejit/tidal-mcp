@@ -233,6 +233,12 @@ const ARTIST_SEPARATORS = /( & |, and |, | feat\.? | ft\.? | featuring | x | vs\
 
 const NON_ASCII = /[^\x00-\x7f]/;
 
+/**
+ * The case-insensitive identity of an artist name: lowercase, ASCII letters only, exactly like
+ * SQLite's lower(), so JS and SQL agree on which spellings are one artist.
+ */
+const fold = (s: string) => (NON_ASCII.test(s) ? s.replace(/[A-Z]+/g, (m) => m.toLowerCase()) : s.toLowerCase());
+
 function artistParts(name: string): string[] {
   return name.split(ARTIST_SEPARATORS).filter((_, i) => i % 2 === 0);
 }
@@ -279,13 +285,13 @@ const decode = <T>(json: string | null | undefined): T | null | undefined =>
  * leftover parts stay together: "Tyler, The Creator & Kali Uchis" credits "Tyler, The Creator"
  * even if only Kali Uchis is known.
  *
- * Returns lowercased names. A leftover part's display name goes into `extra`.
+ * Returns folded names (see fold). A leftover part's display name goes into `extra`.
  */
 function credits(name: string, known: Map<string, string>, extra: Map<string, string>): string[] {
   const tokens = name.split(ARTIST_SEPARATORS); // parts at even indexes, separators between
-  const lower = name.toLowerCase();
+  const lower = fold(name);
   if (tokens.length === 1) return [lower];
-  const low = tokens.map((t) => t.toLowerCase());
+  const low = tokens.map(fold);
   if (tokens.length === 3) {
     // Two parts, the usual case: split if either is known.
     if (!known.has(low[0]) && !known.has(low[2])) return [lower];
@@ -611,11 +617,11 @@ export class History {
    * Most-played artists in the range, with collaborations credited to each artist.
    *
    * All time is ~10k names, which costs more than the Worker's 10 ms of CPU to receive and credit
-   * in JS. So when a range has over 4,000 names, the first pass leaves out solo names with fewer
-   * than 3 plays that never appear inside a collaboration: they can't change any other artist's
-   * count or reach the top on their own. (Those that do appear in one are fetched, since they
-   * decide how it splits.) A page that reaches artists with fewer than 3 plays is computed again
-   * from every name.
+   * in JS. So when a range has over 4,000 names, the first pass leaves out solo artists with fewer
+   * than 3 plays (across all spellings) that never appear inside a collaboration: they can't
+   * change any other artist's count or reach the top on their own. (Those that do appear in one
+   * are fetched, since they decide how it splits.) A page that reaches artists with fewer than 3
+   * plays is computed again from every name.
    */
   async topArtists(range: Range, limit: number, offset: number) {
     const end = offset + limit;
@@ -647,9 +653,9 @@ export class History {
   }
 
   /**
-   * Every artist in the range ranked by credited plays. Past 4,000 names, solo names with fewer
-   * than `minPlays` plays are included only when they appear inside a collaboration. `plays` and
-   * `names` always cover the whole range.
+   * Every artist in the range ranked by credited plays. Past 4,000 names, solo artists with fewer
+   * than `minPlays` plays across all spellings are included only when they appear inside a
+   * collaboration. `plays` and `names` always cover the whole range.
    */
   private async rankArtists(range: Range, minPlays: number) {
     type Row = { artist: string | null; plays: number; tracks: number; last: number; multi: number };
@@ -666,17 +672,19 @@ export class History {
        -- The totals ride along as one row with no artist.
        SELECT NULL AS artist, COALESCE(SUM(plays), 0) AS plays, COUNT(*) AS tracks, 0 AS last, 0 AS multi FROM a
        UNION ALL
-       SELECT artist, plays, tracks, last, multi FROM a
-       WHERE multi OR plays >= CASE WHEN (SELECT COUNT(*) FROM a) > 4000 THEN ? ELSE 1 END`,
+       -- The cutoff applies to each artist's total across spellings ("Alpha" and "ALPHA"), the
+       -- same identity credit() merges on, so spellings are kept or left out together.
+       SELECT artist, plays, tracks, last, multi
+       FROM (SELECT *, SUM(plays) OVER (PARTITION BY lower(artist)) AS folded FROM a)
+       WHERE multi OR folded >= CASE WHEN (SELECT COUNT(*) FROM a) > 4000 THEN ? ELSE 1 END`,
       [range.from, range.to, minPlays],
     );
     const totals = rows.find((r) => r.artist === null)!;
     const named = rows.filter((r): r is Row & { artist: string } => r.artist !== null);
     if (totals.tracks > 4000 && minPlays > 1) {
       // Solo names left out above still decide how a collaboration splits ("A & B" credits A only
-      // if A appears on its own), so fetch the ones that appear inside a collaboration. Keys use
-      // SQLite's lower(), which only folds ASCII.
-      const fold = (s: string) => (NON_ASCII.test(s) ? s.replace(/[A-Z]+/g, (m) => m.toLowerCase()) : s.toLowerCase());
+      // if A appears on its own), so fetch the ones that appear inside a collaboration, in every
+      // spelling. Spellings were left out together, so none of these are already in `named`.
       const have = new Set(named.map((r) => fold(r.artist)));
       const parts = new Set<string>();
       for (const r of named) {
@@ -687,8 +695,8 @@ export class History {
           `SELECT t.artist, SUM(c.plays) AS plays, COUNT(*) AS tracks, MAX(c.last) AS last, 0 AS multi
            FROM (${counts}) c JOIN lastfm_tracks t ON t.id = c.track
            WHERE lower(t.artist) IN (SELECT value FROM json_each(?))
-           GROUP BY t.artist HAVING SUM(c.plays) < ?`,
-          [range.from, range.to, JSON.stringify([...parts]), minPlays],
+           GROUP BY t.artist`,
+          [range.from, range.to, JSON.stringify([...parts])],
         );
         named.push(...extra);
       }
@@ -698,10 +706,15 @@ export class History {
 
   /** Credits each artist name's plays to the artists in it, ranked. */
   private credit(rows: { artist: string; plays: number; tracks: number; last: number; multi: number }[]) {
+    // Folded name to display name: the most-played spelling.
     const known = new Map<string, string>();
+    const spellingPlays = new Map<string, number>();
     const keys = rows.map((r) => {
-      const key = r.artist.toLowerCase();
-      if (!known.has(key)) known.set(key, r.artist);
+      const key = fold(r.artist);
+      if (!((spellingPlays.get(key) ?? -1) >= r.plays)) {
+        known.set(key, r.artist);
+        spellingPlays.set(key, r.plays);
+      }
       return key;
     });
     const byKey = new Map<string, HistoryArtist>();
