@@ -16,6 +16,8 @@ MCP server for TIDAL playlists. One codebase, two runtimes: `src/core` (runtime-
 - **Worker config is secrets, not `vars`**: `TIDAL_CLIENT_ID`, `ALLOWED_TIDAL_USER_IDS`, `GITHUB_TOKEN`, `FEEDBACK_REPO`. A `vars` entry would collide with a secret and clobber it on deploy.
 - **Deploying** is `npm run deploy` from an up-to-date `main` on the owner's machine (Wrangler is logged in there). There is no deploy from CI.
 - **After a deploy that changes tool names, descriptions or schemas,** ChatGPT keeps the old definitions until someone clicks **Refresh tools** at https://chatgpt.com/settings/plugins-settings/plugin_asdk_app_6afa71a11db08191a6d5a70c8ed47cfe (the T3 browser is signed in to ChatGPT).
+- **A new TIDAL scope** (e.g. `recommendations.read` for mixes) takes three steps, all doable in the signed-in T3 browser: enable it on the app at https://developer.tidal.com/dashboard (app `tidal-mcp`, Settings → Edit), add it to `TIDAL_SCOPES` in `src/core/tidal.ts`, and after deploying reconnect TIDAL from the ChatGPT plugin settings page so the grant includes it. Re-run `node dist/cli.js login` for the local session too. Until a user reconnects, tools needing the scope should return a clear "reconnect TIDAL" error, not a raw 403.
+- **TIDAL's API has no listening-history endpoint.** The closest signals are personalized mixes (`userDailyMixes`, `userDiscoveryMixes`, `userRecommendationBlocks`) and TIDAL-generated playlists in the user's library (check `playlistType`).
 - The npm name `tidal-mcp` belongs to an unrelated package; docs should only ever say to run this project from a clone.
 
 ## Reviews

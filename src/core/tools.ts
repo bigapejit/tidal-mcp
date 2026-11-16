@@ -1,11 +1,11 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { ServerOptions } from "@modelcontextprotocol/sdk/server/index.js";
 import { z } from "zod";
-import { fileIssue, type FeedbackConfig } from "./feedback.js";
+import { describeStatus, feedbackStatus, fileIssue, type FeedbackConfig } from "./feedback.js";
 import type { Playlist, Tidal, Track } from "./tidal.js";
 import { WIDGET_HTML } from "./widget.js";
 
-export const VERSION = "0.4.0";
+export const VERSION = "0.4.1";
 
 /**
  * MCP Apps UI (https://modelcontextprotocol.io/extensions/apps). The URI carries the version,
@@ -327,10 +327,32 @@ export function createServer(
           kind: z.enum(["bug", "idea", "ux"]).default("bug"),
         },
         annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+        _meta: withView,
       },
       safe(async ({ title, body, kind }) => {
         const issue = await fileIssue(feedback, { title, body, kind }, { version: VERSION });
-        return result(`Filed issue #${issue.number}: ${issue.url}`);
+        const status = await feedbackStatus(feedback, undefined, issue);
+        return result(`${describeStatus(status)}\nThe card tracks it live until it ships.`, {
+          kind: "feedback",
+          status,
+        });
+      }),
+    );
+
+    server.registerTool(
+      "feedback_status",
+      {
+        title: "Feedback status",
+        description:
+          "How far a filed feedback issue is from shipping: queued, building, in review, shipping, live, or " +
+          "blocked on the user, with a typical time to ship. Defaults to the most recent feedback.",
+        inputSchema: { issue: z.number().int().positive().optional().describe("Issue number; omit for the latest") },
+        annotations: { readOnlyHint: true, openWorldHint: true },
+        _meta: withView,
+      },
+      safe(async ({ issue }) => {
+        const status = await feedbackStatus(feedback, issue);
+        return result(describeStatus(status), { kind: "feedback", status });
       }),
     );
   }

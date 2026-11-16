@@ -29,7 +29,7 @@ Optionally, the server can expose `send_feedback`: tell the assistant "file this
 
 ```sh
 npx wrangler secret put FEEDBACK_REPO    # owner/name, e.g. you/tidal-mcp
-npx wrangler secret put GITHUB_TOKEN     # fine-grained token: that one repo, Issues read & write
+npx wrangler secret put GITHUB_TOKEN     # fine-grained token: that one repo, Issues read & write, Pull requests read
 ```
 
 Issues are public, so the tool tells the model to leave out personal details. Without these secrets the tool doesn't exist.
@@ -50,7 +50,8 @@ This repo goes one step further: a GitHub webhook hands each `feedback` issue to
 | `remove_tracks` | Remove tracks from a playlist |
 | `update_playlist` | Rename, re-describe, or change visibility |
 | `delete_playlist` | Delete a playlist (annotated as destructive, so clients ask first) |
-| `send_feedback` | File feedback as a GitHub issue (only when configured, see below) |
+| `send_feedback` | File feedback as a GitHub issue and show a live tracker until it ships (only when configured) |
+| `feedback_status` | Where a filed issue is: queued, building, in review, shipping, live, or blocked |
 
 ## 1. Create a TIDAL developer app
 

@@ -95,6 +95,31 @@ export const WIDGET_HTML = String.raw`<!doctype html>
   .missing { margin: 12px 8px 0; padding: 10px 12px; border-radius: 8px; background: var(--chip); color: var(--muted); font-size: 12.5px; }
   .missing strong { color: var(--ink); font-weight: 600; }
   .empty { padding: 16px 8px; color: var(--muted); }
+
+  .fb { padding: 10px 10px 12px; }
+  .fb-top { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
+  .fb h1 { font-size: 16px; line-height: 1.3; margin: 4px 0 0; font-weight: 650; overflow-wrap: anywhere; }
+  .fb .open { margin-top: 0; flex: none; }
+  .steps { list-style: none; margin: 16px 0 12px; padding: 0; display: grid; grid-template-columns: repeat(5, 1fr); }
+  .step { position: relative; text-align: center; font-size: 11.5px; color: var(--faint); }
+  .step::before { content: ""; position: absolute; top: 6px; left: -50%; width: 100%; height: 2px; background: var(--line); }
+  .step:first-child::before { display: none; }
+  .step .dot { position: relative; display: block; width: 14px; height: 14px; margin: 0 auto 6px; border-radius: 50%; background: var(--line); }
+  .step.done, .step.now { color: var(--ink); }
+  .step.done::before, .step.now::before { background: var(--accent); }
+  .step.done .dot { background: var(--accent); }
+  .step.now .dot { background: var(--bg); box-shadow: 0 0 0 3px var(--accent) inset; animation: pulse 1.6s ease-in-out infinite; }
+  .fb.blocked .step.now .dot { box-shadow: 0 0 0 3px #d97706 inset; animation: none; }
+  @keyframes pulse { 50% { box-shadow: 0 0 0 3px var(--accent) inset, 0 0 0 6px color-mix(in srgb, var(--accent) 25%, transparent); } }
+  @media (prefers-reduced-motion: reduce) { .step.now .dot { animation: none; } }
+  .fb-detail { margin: 0 0 10px; color: var(--ink); font-size: 13.5px; }
+  .bar { height: 4px; border-radius: 4px; background: var(--chip); overflow: hidden; }
+  .bar > span { display: block; height: 100%; background: var(--accent); border-radius: 4px; transition: width .6s ease; }
+  .fb-eta { display: flex; justify-content: space-between; gap: 12px; margin-top: 8px; color: var(--muted); font-size: 12.5px; font-variant-numeric: tabular-nums; }
+  .fb-eta strong { color: var(--ink); font-weight: 600; }
+  .badge { display: inline-block; font-size: 11px; font-weight: 700; letter-spacing: .04em; padding: 2px 7px; border-radius: 999px; background: var(--chip); color: var(--muted); }
+  .badge.live { background: color-mix(in srgb, var(--accent) 18%, transparent); color: var(--accent); }
+  .badge.warn { background: color-mix(in srgb, #d97706 18%, transparent); color: #d97706; }
 </style>
 </head>
 <body>
@@ -284,11 +309,86 @@ export const WIDGET_HTML = String.raw`<!doctype html>
     }
   }
 
+  // ---- Feedback tracker: follows a filed issue until it ships, refreshing itself.
+  var STEPS = [
+    ["queued", "Filed"], ["building", "Building"], ["review", "Review"], ["shipping", "Shipping"], ["live", "Live"]
+  ];
+  var FINAL = { live: 1, blocked: 1, closed: 1 };
+  var poll = null;
+
+  function minutesSince(iso) { return Math.max(0, (Date.now() - Date.parse(iso)) / 60000); }
+  function clock(iso) {
+    try { return new Date(iso).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }); } catch (e) { return ""; }
+  }
+
+  function renderFeedback(s) {
+    var box = el("div", "fb" + (s.stage === "blocked" ? " blocked" : ""));
+    var top = el("div", "fb-top");
+    var head = el("div");
+    var badgeText = s.stage === "live" ? "Shipped" : s.stage === "blocked" ? "Needs you" : s.stage === "closed" ? "Closed" : "In progress";
+    var badgeCls = s.stage === "live" ? "badge live" : s.stage === "blocked" ? "badge warn" : "badge";
+    var eyebrow = el("div", "eyebrow", "Feedback · #" + s.number + " ");
+    eyebrow.appendChild(el("span", badgeCls, badgeText));
+    head.appendChild(eyebrow);
+    head.appendChild(el("h1", "", s.title));
+    top.appendChild(head);
+    var link = el("button", "open", s.pr ? "View PR" : "View issue"); link.type = "button";
+    link.onclick = function () { openLink(s.pr ? s.pr.url : s.url); };
+    top.appendChild(link);
+    box.appendChild(top);
+
+    var order = STEPS.map(function (x) { return x[0]; });
+    var at = s.stage === "blocked" ? (s.pr ? 2 : 1) : s.stage === "closed" ? 4 : order.indexOf(s.stage);
+    var ol = el("ol", "steps");
+    STEPS.forEach(function (step, i) {
+      var cls = s.stage === "live" || i < at ? "step done" : i === at ? "step now" : "step";
+      var li = el("li", cls); li.appendChild(el("span", "dot")); li.appendChild(document.createTextNode(step[1]));
+      if (i === at && s.stage !== "live") li.setAttribute("aria-current", "step");
+      ol.appendChild(li);
+    });
+    box.appendChild(ol);
+    box.appendChild(el("p", "fb-detail", s.detail));
+
+    var elapsed = minutesSince(s.filedAt);
+    var typical = s.typicalMinutes || 35;
+    var pct = s.stage === "live" ? 100 : FINAL[s.stage] ? Math.min(100, (at / 4) * 100) : Math.min(95, Math.max(4, (elapsed / typical) * 100));
+    var bar = el("div", "bar"); var fill = el("span"); fill.style.width = pct + "%"; bar.appendChild(fill);
+    box.appendChild(bar);
+
+    var eta = el("div", "fb-eta");
+    var left = el("span"); var right = el("span");
+    if (s.stage === "live") {
+      left.textContent = "Shipped" + (s.shippedAt ? " at " + clock(s.shippedAt) : "");
+      if (s.shippedAt) right.textContent = "took " + Math.max(1, Math.round((Date.parse(s.shippedAt) - Date.parse(s.filedAt)) / 60000)) + " min";
+    } else if (FINAL[s.stage]) {
+      left.textContent = "Filed at " + clock(s.filedAt);
+    } else {
+      var remaining = Math.round(typical - elapsed);
+      left.textContent = "Filed " + Math.round(elapsed) + " min ago";
+      var strong = el("strong", "", remaining > 1 ? "about " + remaining + " min left" : "any minute now");
+      right.appendChild(strong);
+    }
+    eta.appendChild(left); eta.appendChild(right);
+    box.appendChild(eta);
+    app.appendChild(box);
+
+    if (poll) clearTimeout(poll);
+    if (!FINAL[s.stage] && elapsed < 180) {
+      poll = setTimeout(function () {
+        request("tools/call", { name: "feedback_status", arguments: { issue: s.number } }).then(function (res) {
+          if (res && res.structuredContent) render(res.structuredContent);
+          else render({ kind: "feedback", status: s }); // keep the clock moving even if the host can't call tools
+        });
+      }, 30000);
+    }
+  }
+
   function render(data) {
     if (!data || !data.kind) return;
     app.textContent = "";
     if (data.kind === "playlist") renderPlaylist(data);
     else if (data.kind === "playlists") renderPlaylists(data);
+    else if (data.kind === "feedback") renderFeedback(data.status || {});
     else renderTracks(data);
   }
 
