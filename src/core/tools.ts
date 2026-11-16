@@ -13,7 +13,7 @@ import {
 import type { Playlist, Tidal, Track } from "./tidal.js";
 import { WIDGET_HTML } from "./widget.js";
 
-export const VERSION = "0.6.0";
+export const VERSION = "0.6.1";
 
 /**
  * MCP Apps UI (https://modelcontextprotocol.io/extensions/apps). The URI carries the version,
@@ -38,6 +38,7 @@ const playlistLine = (p: Playlist) =>
 type ToolResult = {
   content: { type: "text"; text: string }[];
   structuredContent?: Record<string, unknown>;
+  _meta?: Record<string, unknown>;
   isError?: boolean;
 };
 
@@ -49,11 +50,50 @@ const VIEW_HINT =
   "\n\n[If the TIDAL view is shown to the user, it already displays this with album art, durations " +
   "and links. Reply in one or two sentences; don't repeat the list as a table or embed images.]";
 
+/**
+ * ChatGPT renders text between two dollar signs as math, so a reply naming $uicideboy$ (or two
+ * artists like A$AP Rocky) shows italics with the dollars gone unless the model escapes them.
+ */
+const DOLLAR_NOTE =
+  "\n\nNames are literal: escape each $ in a name as \\$ when you write it in markdown (\\$uicideboy\\$), " +
+  "or it renders as math.";
+
+/** Image fields the view shows. Their URLs go only to the view, under IMAGES_META. */
+const IMAGE_KEYS = new Set(["cover", "picture"]);
+const IMAGES_META = "tidal-mcp/images";
+
+/**
+ * Splits image URLs out of tool data: returns the data without them, plus a mirror of its shape
+ * holding only them (undefined when there are none). ChatGPT shows structuredContent to the model,
+ * which then embeds covers as markdown images that render as broken "Unverified image" boxes;
+ * `_meta` reaches only the view.
+ */
+function splitImages(value: unknown): [unknown, unknown] {
+  if (Array.isArray(value)) {
+    const parts = value.map(splitImages);
+    return [parts.map(([rest]) => rest), parts.some(([, i]) => i) ? parts.map(([, i]) => i ?? null) : undefined];
+  }
+  if (!value || typeof value !== "object") return [value, undefined];
+  const rest: Record<string, unknown> = {};
+  const images: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(value)) {
+    if (IMAGE_KEYS.has(k) && typeof v === "string") images[k] = v;
+    else [rest[k], images[k]] = splitImages(v);
+    if (images[k] === undefined) delete images[k];
+  }
+  return [rest, Object.keys(images).length ? images : undefined];
+}
+
 /** Text for the model, plus optional structured data for the inline view. */
-const result = (text: string, structuredContent?: Record<string, unknown>): ToolResult => ({
-  content: [{ type: "text", text: structuredContent ? text + VIEW_HINT : text }],
-  ...(structuredContent ? { structuredContent } : {}),
-});
+function result(text: string, data?: Record<string, unknown>): ToolResult {
+  const [structuredContent, images] = data ? (splitImages(data) as [Record<string, unknown>, unknown]) : [];
+  const dollars = text.includes("$") || (structuredContent && JSON.stringify(structuredContent).includes("$"));
+  return {
+    content: [{ type: "text", text: text + (dollars ? DOLLAR_NOTE : "") + (structuredContent ? VIEW_HINT : "") }],
+    ...(structuredContent ? { structuredContent } : {}),
+    ...(images ? { _meta: { [IMAGES_META]: images } } : {}),
+  };
+}
 
 /** Every tool reports failures as tool errors so the model can see and recover from them. */
 function safe<A>(fn: (args: A) => Promise<ToolResult>) {
@@ -420,10 +460,12 @@ export function createServer(
         annotations: { readOnlyHint: true, openWorldHint: true },
         _meta: withView,
       },
-      safe(async ({ period, from, to, artist, limit, page }) => {
+      safe(async ({ period, from, to, artist: filter, limit, page }) => {
         const r = parseRange({ period, from, to });
         const coverage = await history.refresh();
         const offset = (page - 1) * limit;
+        // A model following DOLLAR_NOTE may pass a name as it wrote it in markdown: \$uicideboy\$.
+        const artist = filter?.replace(/\\\$/g, "$");
         const top = await history.topTracks(r, limit, offset, artist);
         const pending = await history.matchTracks(tidal, top.tracks);
         const tracks = top.tracks;

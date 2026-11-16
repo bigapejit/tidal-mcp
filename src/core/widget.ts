@@ -151,10 +151,31 @@ export const WIDGET_HTML = String.raw`<!doctype html>
     if (m.id !== undefined && !m.method && pending[m.id]) {
       pending[m.id](m.result || {}); delete pending[m.id]; return;
     }
-    if (m.method === "ui/notifications/tool-result") render(m.params && m.params.structuredContent);
+    if (m.method === "ui/notifications/tool-result") render(viewData(m.params, hostMeta()));
     else if (m.method === "ui/notifications/host-context-changed") applyContext(m.params);
     else if (m.method && m.id !== undefined) post({ id: m.id, result: {} }); // e.g. resource-teardown
   });
+
+  // Image URLs arrive in the result's _meta, which hosts keep from the model, mirroring the shape
+  // of structuredContent. ChatGPT also exposes _meta as window.openai.toolResponseMetadata.
+  var IMAGES = "tidal-mcp/images";
+  function addImages(data, images) {
+    if (!data || typeof data !== "object" || !images || typeof images !== "object") return;
+    Object.keys(images).forEach(function (k) {
+      if (k === "__proto__" || k === "constructor" || k === "prototype") return;
+      var v = images[k];
+      if (typeof v === "string") data[k] = v;
+      else addImages(data[k], v);
+    });
+  }
+  function viewData(result, fallbackMeta) {
+    var data = result && result.structuredContent;
+    var meta = (result && result._meta) || fallbackMeta;
+    if (data && meta) addImages(data, meta[IMAGES]);
+    return data;
+  }
+  // The result this view was opened for, as ChatGPT exposes it (in case its notification lacks _meta).
+  function hostMeta() { return window.openai && window.openai.toolResponseMetadata; }
 
   function applyContext(ctx) {
     if (!ctx) return;
@@ -436,7 +457,7 @@ export const WIDGET_HTML = String.raw`<!doctype html>
     if (!FINAL[s.stage] && elapsed < 180) {
       poll = setTimeout(function () {
         request("tools/call", { name: "feedback_status", arguments: { issue: s.number } }).then(function (res) {
-          if (res && res.structuredContent) render(res.structuredContent);
+          if (res && res.structuredContent) render(viewData(res));
           else render({ kind: "feedback", status: s }); // keep the clock moving even if the host can't call tools
         });
       }, 30000);
@@ -463,7 +484,9 @@ export const WIDGET_HTML = String.raw`<!doctype html>
   });
 
   // Hosts that also expose the result directly (ChatGPT's window.openai).
-  if (window.openai && window.openai.toolOutput) render(window.openai.toolOutput);
+  if (window.openai && window.openai.toolOutput) {
+    render(viewData({ structuredContent: window.openai.toolOutput }, hostMeta()));
+  }
 })();
 </script>
 </body>
