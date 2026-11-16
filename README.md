@@ -11,6 +11,18 @@ Run it two ways:
 - **Remote, on Cloudflare Workers (free plan).** You get an HTTPS URL for ChatGPT, Claude.ai, or anything else that needs one. Always on.
 - **Local, over stdio.** For Claude Code, Claude Desktop, Codex, and other clients that launch a local command.
 
+## Inline view
+
+In clients that support [MCP Apps](https://modelcontextprotocol.io/extensions/apps), including ChatGPT, Claude, and VS Code, results render as a card instead of text:
+
+- **Playlists:** cover, track count, total length, an "Open in TIDAL" button, and the track list.
+- **Track lists** (search, matches, similar tracks): album art, artists, album, explicit badges, and durations, 12 at a time.
+- **Your library:** a grid of playlist covers, two rows at a time.
+
+Clicking a track or playlist opens it in TIDAL. The card follows the host's light or dark theme. Clients without MCP Apps support get the same results as compact text.
+
+The view is one self-contained page (`src/core/widget.ts`) that talks to the host over the MCP Apps postMessage protocol directly, with no bundle or external scripts. Its only network access is TIDAL's image CDN.
+
 ## Tools
 
 | Tool | What it does |
@@ -107,7 +119,7 @@ node dist/cli.js logout     Delete the saved session and settings
 ## Project layout
 
 ```
-src/core/     TIDAL API client and MCP tools (runtime-neutral: fetch + Web Crypto)
+src/core/     TIDAL API client, MCP tools, and the inline view (runtime-neutral: fetch + Web Crypto)
 src/node/     Local login flow and token storage
 src/worker/   Cloudflare Worker: OAuth server, TIDAL sign-in, stateless MCP endpoint
 src/cli.ts    Local entry point (stdio server + login/status/logout)

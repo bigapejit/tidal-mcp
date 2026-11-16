@@ -31,8 +31,12 @@ export interface Track {
   title: string;
   artists: string[];
   album?: string;
+  /** "m:ss" or "h:mm:ss". */
   duration?: string;
+  durationSeconds?: number;
   explicit?: boolean;
+  /** Album cover, about 320px square. */
+  cover?: string;
   url: string;
 }
 
@@ -42,6 +46,9 @@ export interface Playlist {
   description?: string;
   visibility?: string;
   trackCount?: number;
+  durationSeconds?: number;
+  /** Playlist cover, about 320px square. */
+  cover?: string;
   url: string;
 }
 
@@ -67,32 +74,56 @@ const ids = (rel: { data?: Identifier | Identifier[] } | undefined): string[] =>
 
 const index = (rs: Resource[]) => new Map(rs.map((r) => [`${r.type}:${r.id}`, r]));
 
-function formatDuration(iso?: string): string | undefined {
+/** ISO 8601 duration ("PT3M5S") to seconds. */
+function seconds(iso?: string): number | undefined {
   const m = iso?.match(/^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)(?:\.\d+)?S)?$/);
-  if (!m) return iso;
+  if (!m) return undefined;
   const [h, min, s] = [m[1], m[2], m[3]].map((x) => Number(x ?? 0));
-  const ss = String(s).padStart(2, "0");
-  return h ? `${h}:${String(min).padStart(2, "0")}:${ss}` : `${min}:${ss}`;
+  return h * 3600 + min * 60 + s;
+}
+
+export function formatDuration(total?: number): string | undefined {
+  if (total === undefined) return undefined;
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const ss = String(total % 60).padStart(2, "0");
+  return h ? `${h}:${String(m).padStart(2, "0")}:${ss}` : `${m}:${ss}`;
+}
+
+/** The artwork file closest to, but not under, the 300px the UI shows. */
+function coverUrl(artworkIds: string[], included: Map<string, Resource>): string | undefined {
+  for (const id of artworkIds) {
+    const files: { href: string; meta?: { width?: number } }[] =
+      included.get(`artworks:${id}`)?.attributes?.files ?? [];
+    if (!files.length) continue;
+    const bySize = [...files].sort((a, b) => (a.meta?.width ?? 0) - (b.meta?.width ?? 0));
+    return (bySize.find((f) => (f.meta?.width ?? 0) >= 300) ?? bySize[bySize.length - 1]).href;
+  }
+  return undefined;
 }
 
 function toTrack(r: Resource, included: Map<string, Resource>): Track {
   const a = r.attributes ?? {};
+  const album = ids(r.relationships?.albums)
+    .map((id) => included.get(`albums:${id}`))
+    .find(Boolean);
+  const durationSeconds = seconds(a.duration);
   return {
     id: r.id,
     title: a.version ? `${a.title} (${a.version})` : a.title,
     artists: ids(r.relationships?.artists)
       .map((id) => included.get(`artists:${id}`)?.attributes?.name)
       .filter(Boolean),
-    album: ids(r.relationships?.albums)
-      .map((id) => included.get(`albums:${id}`)?.attributes?.title)
-      .find(Boolean),
-    duration: formatDuration(a.duration),
+    album: album?.attributes?.title,
+    duration: formatDuration(durationSeconds),
+    durationSeconds,
     explicit: a.explicit || undefined,
+    cover: album ? coverUrl(ids(album.relationships?.coverArt), included) : undefined,
     url: `https://tidal.com/track/${r.id}`,
   };
 }
 
-function toPlaylist(r: Resource): Playlist {
+function toPlaylist(r: Resource, included = new Map<string, Resource>()): Playlist {
   const a = r.attributes ?? {};
   return {
     id: r.id,
@@ -100,6 +131,8 @@ function toPlaylist(r: Resource): Playlist {
     description: a.description || undefined,
     visibility: a.accessType,
     trackCount: a.numberOfItems,
+    durationSeconds: seconds(a.duration),
+    cover: coverUrl(ids(r.relationships?.coverArt), included),
     url: `https://tidal.com/playlist/${r.id}`,
   };
 }
@@ -197,7 +230,7 @@ export class Tidal {
     for (const batch of chunk([...new Set(trackIds)], 20)) {
       const { data, included } = await this.collect(
         "/tracks",
-        { "filter[id]": batch.join(","), include: "artists,albums", countryCode },
+        { "filter[id]": batch.join(","), include: "artists,albums.coverArt", countryCode },
         batch.length,
       );
       const inc = index(included);
@@ -224,19 +257,20 @@ export class Tidal {
   }
 
   async listMyPlaylists(limit: number): Promise<Playlist[]> {
-    const { data } = await this.collect(
+    const { data, included } = await this.collect(
       "/playlists",
-      { "filter[owners.id]": "me", countryCode: await this.country(), sort: "-lastModifiedAt" },
+      { "filter[owners.id]": "me", countryCode: await this.country(), sort: "-lastModifiedAt", include: "coverArt" },
       limit,
     );
-    return data.map(toPlaylist);
+    const inc = index(included);
+    return data.map((r) => toPlaylist(r, inc));
   }
 
   async getPlaylist(id: string): Promise<Playlist> {
     const doc = await this.request("GET", `/playlists/${encodeURIComponent(id)}`, {
-      query: { countryCode: await this.country() },
+      query: { countryCode: await this.country(), include: "coverArt" },
     });
-    return toPlaylist(doc!.data as Resource);
+    return toPlaylist(doc!.data as Resource, index(doc!.included ?? []));
   }
 
   /** Playlist entries in order, with the per-entry itemId TIDAL needs for removal. */
